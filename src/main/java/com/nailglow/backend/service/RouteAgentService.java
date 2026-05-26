@@ -62,6 +62,7 @@ public class RouteAgentService {
             builder.environment().put("ARK_BASE_URL", effectiveBaseUrl);
             builder.environment().put("AI_BASE_URL", effectiveBaseUrl);
             builder.environment().put("ROUTE_AGENT_MODEL", effectiveModel);
+            builder.environment().put("ROUTE_AGENT_TIMEOUT_SECONDS", String.valueOf(timeoutSeconds));
             if (effectiveApiKey != null && !effectiveApiKey.isBlank()) {
                 builder.environment().put("ARK_API_KEY", effectiveApiKey);
                 builder.environment().put("AI_API_KEY", effectiveApiKey);

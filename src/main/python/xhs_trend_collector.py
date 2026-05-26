@@ -373,6 +373,10 @@ def launch_chrome(chrome_executable: str, debug_port: int, user_data_dir: str, h
         "--disable-features=Translate,MediaRouter",
         "--remote-allow-origins=*",
     ]
+    if os.name != "nt":
+        args.append("--disable-dev-shm-usage")
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            args.append("--no-sandbox")
     if headless:
         args.extend(["--headless=new", "--disable-gpu"])
     else:

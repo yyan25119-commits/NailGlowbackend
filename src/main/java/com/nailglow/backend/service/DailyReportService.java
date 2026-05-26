@@ -142,6 +142,7 @@ public class DailyReportService {
             body.put("model", effectiveModel);
             body.put("temperature", 0.25);
             body.put("max_tokens", 1600);
+            body.put("thinking", Map.of("type", "disabled"));
             body.put("messages", List.of(
                     Map.of("role", "system", "content", dailyReportSystemPrompt()),
                     Map.of("role", "user", "content", mapper.writeValueAsString(dailyReportAiContext(data)))

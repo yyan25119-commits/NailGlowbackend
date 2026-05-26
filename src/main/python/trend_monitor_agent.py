@@ -89,6 +89,20 @@ def build_client():
     return OpenAI(**kwargs)
 
 
+def create_chat_completion(body: Dict[str, Any]) -> Dict[str, Any]:
+    request_kwargs = dict(body)
+    request_kwargs["thinking"] = {"type": "disabled"}
+    client = build_client()
+    try:
+        response = client.chat.completions.create(**request_kwargs)
+    except TypeError as exc:
+        if "unexpected keyword argument 'thinking'" not in str(exc):
+            raise
+        request_kwargs.pop("thinking", None)
+        response = client.chat.completions.create(**request_kwargs)
+    return normalize_response(response)
+
+
 def normalize_response(response: Any) -> Dict[str, Any]:
     if isinstance(response, dict):
         return response
@@ -244,7 +258,7 @@ def ai_analyze(payload: Dict[str, Any]) -> Dict[str, Any]:
         ],
     }
 
-    response = normalize_response(build_client().chat.completions.create(**body))
+    response = create_chat_completion(body)
     choices = safe_list(response.get("choices"))
     message = choices[0].get("message", {}) if choices else {}
     content = message.get("content", "") if isinstance(message, dict) else ""
@@ -296,7 +310,7 @@ def ai_keyword_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
             {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
         ],
     }
-    response = normalize_response(build_client().chat.completions.create(**body))
+    response = create_chat_completion(body)
     choices = safe_list(response.get("choices"))
     message = choices[0].get("message", {}) if choices else {}
     content = message.get("content", "") if isinstance(message, dict) else ""

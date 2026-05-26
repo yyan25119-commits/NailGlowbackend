@@ -515,14 +515,22 @@ def build_initial_state(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def run_llm_once(state: Dict[str, Any], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
     client = build_client()
-    response = client.chat.completions.create(
-        model=ARK_MODEL,
-        messages=state["messages"],
-        temperature=0.2,
-        tools=tools or None,
-        tool_choice="auto" if tools else None,
-        stream=False,
-    )
+    request_kwargs: Dict[str, Any] = {
+        "model": ARK_MODEL,
+        "messages": state["messages"],
+        "temperature": 0.2,
+        "tools": tools or None,
+        "tool_choice": "auto" if tools else None,
+        "stream": False,
+        "thinking": {"type": "disabled"},
+    }
+    try:
+        response = client.chat.completions.create(**request_kwargs)
+    except TypeError as exc:
+        if "unexpected keyword argument 'thinking'" not in str(exc):
+            raise
+        request_kwargs.pop("thinking", None)
+        response = client.chat.completions.create(**request_kwargs)
     return normalize_response(response)
 
 
