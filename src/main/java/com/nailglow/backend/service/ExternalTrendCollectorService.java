@@ -128,11 +128,11 @@ public class ExternalTrendCollectorService {
                 "targetCount", targetCount
         ));
         persistBatch(batchId, items, insight, platformSummary);
+        prunePreviousTrendBatches(batchId);
         return buildSnapshot(batchId);
     }
 
     private void cleanupBeforeRefresh() {
-        clearPreviousTrendBatches();
         cleanDirectoryContents(resolveTempUserDataDir());
         cleanDirectoryContents(resolveLegacyNestedRuntimeDir().resolve("trend-agent-headless-profile"));
     }
@@ -140,6 +140,14 @@ public class ExternalTrendCollectorService {
     private void clearPreviousTrendBatches() {
         jdbc.update("delete from external_style_trends");
         jdbc.update("delete from external_style_trend_batches");
+    }
+
+    private void prunePreviousTrendBatches(String keepBatchId) {
+        if (!StringUtils.hasText(keepBatchId)) {
+            return;
+        }
+        jdbc.update("delete from external_style_trends where batch_id <> ?", keepBatchId);
+        jdbc.update("delete from external_style_trend_batches where batch_id <> ?", keepBatchId);
     }
 
     private Path resolveLegacyNestedRuntimeDir() {
