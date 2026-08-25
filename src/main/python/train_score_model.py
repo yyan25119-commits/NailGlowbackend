@@ -10,26 +10,10 @@ import joblib
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
 
-from score_model_predict import ROOT, image_features, load_style_features, p5p95_normalize
+from score_model_predict import DEFAULT_FEATURE_COLS, ROOT, bool_payload, image_features, load_style_features, p5p95_normalize
 
 
-FEATURE_COLS = [
-    "img_width",
-    "img_height",
-    "aspect_ratio",
-    "brightness_mean",
-    "brightness_std",
-    "r_mean",
-    "g_mean",
-    "b_mean",
-    "skin_mask_ratio",
-    "center_brightness",
-    "style_length",
-    "style_color_warmth",
-    "style_complexity",
-    "style_gloss",
-    "style_edge_roundness",
-]
+FEATURE_COLS = DEFAULT_FEATURE_COLS
 
 
 def read_payload():
@@ -54,12 +38,12 @@ def normalization_stats(rows):
     return stats
 
 
-def sample_features(sample):
+def sample_features(sample, use_mediapipe=True):
     image_path = resolve_path(sample.get("imagePath"))
     if not image_path.exists():
         return None
     style_code = sample.get("styleCode") or "nail_01"
-    hand = image_features(image_path)
+    hand = image_features(image_path, use_mediapipe=use_mediapipe)
     style = load_style_features(style_code)
     return {**hand, **{key: value for key, value in style.items() if key.startswith("style_")}}
 
@@ -68,10 +52,11 @@ def main():
     payload = read_payload()
     output_path = resolve_path(payload.get("outputPath"))
     fallback_path = resolve_path(payload.get("fallbackModelPath"))
+    use_mediapipe = bool_payload(payload.get("useMediapipe"), True)
     rows = []
     targets = []
     for sample in payload.get("samples") or []:
-        features = sample_features(sample)
+        features = sample_features(sample, use_mediapipe=use_mediapipe)
         if not features:
             continue
         rows.append(features)

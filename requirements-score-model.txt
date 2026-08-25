@@ -1,0 +1,5 @@
+joblib>=1.4,<2
+mediapipe==0.10.35
+numpy>=2.0,<3
+pillow>=10,<13
+scikit-learn>=1.5,<2

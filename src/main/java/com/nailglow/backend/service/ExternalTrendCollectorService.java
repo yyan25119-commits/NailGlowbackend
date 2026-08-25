@@ -64,14 +64,8 @@ public class ExternalTrendCollectorService {
             new KeywordRule("夏日", List.of("夏天", "夏日"))
     );
     private static final List<String> DEFAULT_XHS_QUERIES = List.of(
-            "显白美甲",
             "法式美甲",
-            "猫眼美甲",
-            "夏天美甲",
-            "裸粉美甲",
-            "短甲美甲",
-            "小香风美甲",
-            "美甲"
+            "显白美甲"
     );
 
     private final JdbcTemplate jdbc;
@@ -84,6 +78,9 @@ public class ExternalTrendCollectorService {
     @Value("${nailglow.trend-agent.chrome-port:9233}")
     private int chromePort;
 
+    @Value("${nailglow.trend-agent.collector-chrome-port:9234}")
+    private int collectorChromePort;
+
     @Value("${nailglow.trend-agent.chrome-path:}")
     private String chromePath;
 
@@ -95,6 +92,12 @@ public class ExternalTrendCollectorService {
 
     @Value("${nailglow.trend-agent.temp-user-data-dir:runtime/trend-agent-headless-profile}")
     private String tempUserDataDir;
+
+    @Value("${nailglow.trend-agent.proxy-server:${XHS_PROXY_SERVER:}}")
+    private String configuredProxyServer;
+
+    @Value("${nailglow.trend-agent.collect-timeout-seconds:120}")
+    private int collectTimeoutSeconds;
 
     @Value("${nailglow.trend-agent.target-count:10}")
     private int targetCount;
@@ -130,6 +133,13 @@ public class ExternalTrendCollectorService {
         persistBatch(batchId, items, insight, platformSummary);
         prunePreviousTrendBatches(batchId);
         return buildSnapshot(batchId);
+    }
+
+    public Map<String, Object> snapshotWithWarning(String warning) {
+        Map<String, Object> data = new LinkedHashMap<>(latestSnapshot());
+        data.put("degraded", true);
+        data.put("warning", StringUtils.hasText(warning) ? warning : "站外热门刷新失败，已回退到最近一次可用快照。");
+        return data;
     }
 
     private void cleanupBeforeRefresh() {
@@ -218,8 +228,7 @@ public class ExternalTrendCollectorService {
         try {
             ProcessBuilder builder = new ProcessBuilder(pythonBin, scriptPath.toString());
             builder.directory(resolveBackendWorkDir().toFile());
-            builder.environment().put("PYTHONIOENCODING", "utf-8");
-            builder.environment().put("PYTHONUTF8", "1");
+            applyCollectorEnvironment(builder);
             Process process = builder.start();
             CompletableFuture<String> stdoutFuture = CompletableFuture.supplyAsync(() -> readAllQuietly(process.getInputStream()));
             CompletableFuture<String> stderrFuture = CompletableFuture.supplyAsync(() -> readAllQuietly(process.getErrorStream()));
@@ -242,12 +251,12 @@ public class ExternalTrendCollectorService {
             if (process.exitValue() != 0) {
                 throw new IllegalStateException(stderr.isBlank() ? "登录态导出失败" : stderr);
             }
-            Map<String, Object> exported = mapper.readValue(stdout.isBlank() ? "{}" : stdout, new TypeReference<>() {
-            });
-            Map<String, Object> data = new LinkedHashMap<>();
-            data.put("sessionStatePath", resolveSessionStatePath().toString());
-            data.put("exportedAt", stringValue(exported.get("exportedAt")));
-            data.put("cookieCount", rawListSize(exported.get("cookies")));
+            if (!stdout.isBlank()) {
+                mapper.readValue(stdout, new TypeReference<Map<String, Object>>() {
+                });
+            }
+            Map<String, Object> data = new LinkedHashMap<>(sessionStatus());
+            data.put("message", "登录态已保存");
             return data;
         } catch (Exception ex) {
             throw new IllegalStateException("保存小红书登录态失败：" + ex.getMessage(), ex);
@@ -317,16 +326,21 @@ public class ExternalTrendCollectorService {
                         "message", "已启动远程登录浏览器，新标签页将打开小红书登录窗口。"
                 );
             }
-            new ProcessBuilder(
+            List<String> command = new ArrayList<>(List.of(
                     chromeExecutable,
                     "--remote-debugging-port=" + chromePort,
                     "--remote-allow-origins=*",
                     "--user-data-dir=" + profilePath,
                     "--no-first-run",
                     "--no-default-browser-check",
-                    "--new-window",
-                    "https://www.xiaohongshu.com/explore")
-                    .start();
+                    "--new-window"
+            ));
+            String proxyServer = resolveProxyServer();
+            if (StringUtils.hasText(proxyServer)) {
+                command.add("--proxy-server=" + proxyServer);
+            }
+            command.add("https://www.xiaohongshu.com/explore");
+            new ProcessBuilder(command).start();
             return Map.of(
                     "opened", true,
                     "chromePort", chromePort,
@@ -414,29 +428,35 @@ public class ExternalTrendCollectorService {
         if (!Files.exists(scriptPath)) {
             throw new IllegalStateException("未找到站外抓取 Agent：" + scriptPath);
         }
+        if (!isWindows()) {
+            ensureLinuxVirtualDisplayReady();
+        }
 
         ProcessBuilder builder = new ProcessBuilder(pythonBin, scriptPath.toString());
         builder.directory(resolveBackendWorkDir().toFile());
-        builder.environment().put("PYTHONIOENCODING", "utf-8");
-        builder.environment().put("PYTHONUTF8", "1");
+        applyCollectorEnvironment(builder);
+        if (!isWindows()) {
+            builder.environment().put("DISPLAY", REMOTE_LOGIN_DISPLAY);
+        }
         Process process = builder.start();
         CompletableFuture<String> stdoutFuture = CompletableFuture.supplyAsync(() -> readAllQuietly(process.getInputStream()));
         CompletableFuture<String> stderrFuture = CompletableFuture.supplyAsync(() -> readAllQuietly(process.getErrorStream()));
 
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("action", "collect");
-        payload.put("debugPort", chromePort);
-        payload.put("targetCount", Math.max(targetCount * 2, 16));
+        payload.put("debugPort", collectorChromePort);
+        payload.put("targetCount", Math.max(targetCount, 10));
         payload.put("queries", queries);
         payload.put("sessionStatePath", resolveSessionStatePath().toString());
         payload.put("tempUserDataDir", resolveTempUserDataDir().toString());
         payload.put("chromeExecutable", resolveChromePath());
+        payload.put("headless", isWindows());
 
         try (BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(process.getOutputStream(), StandardCharsets.UTF_8))) {
             writer.write(mapper.writeValueAsString(payload));
         }
 
-        boolean finished = process.waitFor(45, java.util.concurrent.TimeUnit.SECONDS);
+        boolean finished = process.waitFor(Math.max(45, collectTimeoutSeconds), java.util.concurrent.TimeUnit.SECONDS);
         if (!finished) {
             process.destroyForcibly();
             throw new IllegalStateException("站外抓取 Agent 执行超时");
@@ -570,8 +590,20 @@ public class ExternalTrendCollectorService {
         return System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");
     }
 
-    private void prepareLinuxRemoteLoginBrowser(String chromeExecutable, Path profilePath) throws IOException, InterruptedException {
+    private void ensureLinuxVirtualDisplayReady() throws IOException, InterruptedException {
         String xvfbExecutable = requireExecutable("/usr/bin/Xvfb", "Xvfb");
+        Path runtimeDir = resolveProjectPath("runtime/trend-agent-remote-login");
+        Files.createDirectories(runtimeDir);
+        Path xvfbLog = runtimeDir.resolve("xvfb.log");
+        startBackgroundShellIfMissing(
+                "test -S /tmp/.X11-unix/X99",
+                shellQuote(xvfbExecutable) + " " + REMOTE_LOGIN_DISPLAY + " -screen 0 1440x900x24 -ac +extension RANDR",
+                xvfbLog
+        );
+        Thread.sleep(600);
+    }
+
+    private void prepareLinuxRemoteLoginBrowser(String chromeExecutable, Path profilePath) throws IOException, InterruptedException {
         String x11vncExecutable = requireExecutable("/usr/bin/x11vnc", "x11vnc");
         String websockifyExecutable = requireExecutable("/usr/bin/websockify", "websockify");
         Path noVncDir = Path.of("/usr/share/novnc");
@@ -581,16 +613,11 @@ public class ExternalTrendCollectorService {
 
         Path runtimeDir = resolveProjectPath("runtime/trend-agent-remote-login");
         Files.createDirectories(runtimeDir);
-        Path xvfbLog = runtimeDir.resolve("xvfb.log");
         Path x11vncLog = runtimeDir.resolve("x11vnc.log");
         Path websockifyLog = runtimeDir.resolve("websockify.log");
         Path chromeLog = runtimeDir.resolve("chrome.log");
 
-        startBackgroundShellIfMissing(
-                "test -S /tmp/.X11-unix/X99",
-                shellQuote(xvfbExecutable) + " " + REMOTE_LOGIN_DISPLAY + " -screen 0 1440x900x24 -ac +extension RANDR",
-                xvfbLog
-        );
+        ensureLinuxVirtualDisplayReady();
         startBackgroundShellIfMissing(
                 "ss -ltn | grep -q ':5900 '",
                 shellQuote(x11vncExecutable) + " -display " + REMOTE_LOGIN_DISPLAY + " -forever -shared -rfbport " + REMOTE_LOGIN_VNC_PORT + " -localhost -nopw",
@@ -604,7 +631,7 @@ public class ExternalTrendCollectorService {
 
         Thread.sleep(1200);
 
-        ProcessBuilder builder = new ProcessBuilder(
+        List<String> command = new ArrayList<>(List.of(
                 chromeExecutable,
                 "--remote-debugging-port=" + chromePort,
                 "--remote-allow-origins=*",
@@ -613,9 +640,14 @@ public class ExternalTrendCollectorService {
                 "--no-default-browser-check",
                 "--new-window",
                 "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "https://www.xiaohongshu.com/explore"
-        );
+                "--disable-dev-shm-usage"
+        ));
+        String proxyServer = resolveProxyServer();
+        if (StringUtils.hasText(proxyServer)) {
+            command.add("--proxy-server=" + proxyServer);
+        }
+        command.add("https://www.xiaohongshu.com/explore");
+        ProcessBuilder builder = new ProcessBuilder(command);
         builder.environment().put("DISPLAY", REMOTE_LOGIN_DISPLAY);
         builder.redirectErrorStream(true);
         builder.redirectOutput(ProcessBuilder.Redirect.appendTo(chromeLog.toFile()));
@@ -641,6 +673,22 @@ public class ExternalTrendCollectorService {
 
     private String shellQuote(String value) {
         return "'" + value.replace("'", "'\"'\"'") + "'";
+    }
+
+    private void applyCollectorEnvironment(ProcessBuilder builder) {
+        builder.environment().put("PYTHONIOENCODING", "utf-8");
+        builder.environment().put("PYTHONUTF8", "1");
+        String proxyServer = resolveProxyServer();
+        if (StringUtils.hasText(proxyServer)) {
+            builder.environment().put("XHS_PROXY_SERVER", proxyServer);
+        }
+    }
+
+    private String resolveProxyServer() {
+        if (StringUtils.hasText(configuredProxyServer)) {
+            return configuredProxyServer.trim();
+        }
+        return "";
     }
 
     private Path resolveCollectorScriptPath() {

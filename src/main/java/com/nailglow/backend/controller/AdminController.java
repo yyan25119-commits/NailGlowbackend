@@ -57,6 +57,9 @@ public class AdminController {
     @Value("${nailglow.python.bin:${PYTHON_BIN:python}}")
     private String pythonBin;
 
+    @Value("${nailglow.score-model.use-mediapipe:true}")
+    private boolean scoreModelUseMediapipe;
+
     @Value("${nailglow.doubao.api-key:}")
     private String aiApiKey;
 
@@ -257,7 +260,12 @@ public class AdminController {
             realtime.broadcast("trend_monitor.changed", Map.of("refreshedAt", data.getOrDefault("refreshedAt", "")));
             return ApiResponse.ok(data);
         } catch (Exception ex) {
-            return ApiResponse.fail(ex.getMessage());
+            Map<String, Object> fallback = externalTrendCollector.snapshotWithWarning(ex.getMessage());
+            realtime.broadcast("trend_monitor.changed", Map.of(
+                    "refreshedAt", fallback.getOrDefault("refreshedAt", ""),
+                    "degraded", true
+            ));
+            return ApiResponse.ok(fallback);
         }
     }
 
@@ -816,7 +824,8 @@ public class AdminController {
             Map<String, Object> request = Map.of(
                     "samples", samples,
                     "outputPath", target.toString(),
-                    "fallbackModelPath", fallbackSource.toString()
+                    "fallbackModelPath", fallbackSource.toString(),
+                    "useMediapipe", scoreModelUseMediapipe
             );
             try (BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(process.getOutputStream(), StandardCharsets.UTF_8))) {
                 writer.write(mapper.writeValueAsString(request));

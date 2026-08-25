@@ -32,6 +32,9 @@ public class ScoreModelService {
     @Value("${nailglow.score-model.timeout-seconds:30}")
     private long timeoutSeconds;
 
+    @Value("${nailglow.score-model.use-mediapipe:true}")
+    private boolean useMediapipe;
+
     public Map<String, Object> predict(Path imagePath, String styleCode) {
         Path scriptPath = Path.of("src", "main", "python", "score_model_predict.py").toAbsolutePath().normalize();
         Path modelPath = activeModelPath();
@@ -39,6 +42,7 @@ public class ScoreModelService {
         request.put("imagePath", imagePath.toAbsolutePath().toString());
         request.put("styleCode", styleCode == null || styleCode.isBlank() ? "nail_01" : styleCode);
         request.put("modelPath", modelPath.toString());
+        request.put("useMediapipe", useMediapipe);
 
         try {
             ProcessBuilder builder = new ProcessBuilder(pythonBin, scriptPath.toString())

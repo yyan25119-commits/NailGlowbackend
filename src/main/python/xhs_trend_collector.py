@@ -23,6 +23,10 @@ except ModuleNotFoundError as exc:
         "Missing dependency: websocket-client. Install it with `pip install websocket-client`."
     ) from exc
 
+HTTP_TIMEOUT_SECONDS = int(os.environ.get("XHS_HTTP_TIMEOUT_SECONDS", "20"))
+CDP_TIMEOUT_SECONDS = int(os.environ.get("XHS_CDP_TIMEOUT_SECONDS", "25"))
+BROWSER_START_TIMEOUT_MS = int(os.environ.get("XHS_BROWSER_START_TIMEOUT_MS", "30000"))
+
 
 def read_stdin() -> Dict[str, Any]:
     raw = sys.stdin.buffer.read().decode("utf-8")
@@ -38,16 +42,16 @@ def delay(milliseconds: int) -> None:
 
 
 def http_get_json(url: str) -> Any:
-    with urllib.request.urlopen(url, timeout=12) as response:
+    with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT_SECONDS) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
 def http_get_text(url: str) -> str:
-    with urllib.request.urlopen(url, timeout=12) as response:
+    with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT_SECONDS) as response:
         return response.read().decode("utf-8")
 
 
-def wait_for_browser(debug_port: int, timeout_ms: int = 15000) -> bool:
+def wait_for_browser(debug_port: int, timeout_ms: int = BROWSER_START_TIMEOUT_MS) -> bool:
     deadline = time.time() + timeout_ms / 1000
     while time.time() < deadline:
         try:
@@ -100,7 +104,7 @@ class CDPSession:
     def __enter__(self) -> "CDPSession":
         self.ws = create_connection(
             self.websocket_url,
-            timeout=15,
+            timeout=CDP_TIMEOUT_SECONDS,
             enable_multithread=False,
             suppress_origin=True,
         )
@@ -412,6 +416,7 @@ def ensure_browser_for_collection(payload: Dict[str, Any]) -> Dict[str, Any]:
     session_state_path = str(payload.get("sessionStatePath") or "")
     temp_user_data_dir = str(payload.get("tempUserDataDir") or "")
     chrome_executable = str(payload.get("chromeExecutable") or "")
+    headless = bool(payload.get("headless", True))
 
     if wait_for_browser(debug_port, 1200):
         inject_session(debug_port, read_session_state(session_state_path))
@@ -430,12 +435,12 @@ def ensure_browser_for_collection(payload: Dict[str, Any]) -> Dict[str, Any]:
     for stale in temp_root.glob("session-*"):
         shutil.rmtree(stale, ignore_errors=True)
     launched_user_data_dir = tempfile.mkdtemp(prefix="session-", dir=str(temp_root))
-    launched_process = launch_chrome(chrome_executable, debug_port, launched_user_data_dir, True)
+    launched_process = launch_chrome(chrome_executable, debug_port, launched_user_data_dir, headless)
 
-    ready = wait_for_browser(debug_port, 15000)
+    ready = wait_for_browser(debug_port, BROWSER_START_TIMEOUT_MS)
     if not ready:
         launched_process.kill()
-        raise RuntimeError("Headless Chrome did not start in time")
+        raise RuntimeError("Chrome did not start in time")
 
     inject_session(debug_port, read_session_state(session_state_path))
     target = get_page_target(debug_port) or {}

@@ -436,6 +436,21 @@ public class UserController {
         return ApiResponse.ok(result);
     }
 
+    @GetMapping("/appointments/current")
+    public Map<String, Object> currentAppointment(HttpServletRequest request) {
+        long userId = authService.require(request, "user").id();
+        List<Map<String, Object>> list = jdbc.query("""
+                select a.*, s.name as style_name
+                from appointments a
+                left join nail_styles s on s.id = a.style_id
+                where a.user_id = ?
+                  and a.status not in ('已取消', '已完成')
+                order by coalesce(a.scheduled_at, a.created_at) desc, a.id desc
+                limit 1
+                """, (rs, rowNum) -> currentAppointmentRow(rs), userId);
+        return ApiResponse.ok(list.isEmpty() ? Map.of() : list.get(0));
+    }
+
     @GetMapping("/visit-advice")
     public Map<String, Object> visitAdvice() {
         Integer active = jdbc.queryForObject("select count(*) from try_on_tasks where created_at > date_sub(now(), interval 6 hour)", Integer.class);
@@ -505,6 +520,31 @@ public class UserController {
                   and id <> ?
                 """, Integer.class, Timestamp.valueOf(scheduledAt), excludeAppointmentId);
         return (count == null ? 0 : count) + 1;
+    }
+
+    private Map<String, Object> currentAppointmentRow(ResultSet rs) throws SQLException {
+        Timestamp scheduledAtValue = rs.getTimestamp("scheduled_at");
+        Timestamp createdAtValue = rs.getTimestamp("created_at");
+        LocalDateTime scheduledAt = scheduledAtValue == null
+                ? createdAtValue.toLocalDateTime()
+                : scheduledAtValue.toLocalDateTime();
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("id", rs.getLong("id"));
+        row.put("styleId", rs.getLong("style_id"));
+        row.put("styleName", safeString(rs, "style_name", "未选择款式"));
+        row.put("serviceName", rs.getString("service_name"));
+        row.put("slotTime", rs.getString("slot_time"));
+        row.put("slotTimeUser", rs.getString("slot_time"));
+        row.put("slotTimeAdmin", formatAbsoluteSlotLabel(scheduledAt));
+        row.put("storeName", rs.getString("store_name"));
+        row.put("status", rs.getString("status"));
+        row.put("amount", rs.getBigDecimal("amount"));
+        row.put("paidStatus", safeString(rs, "paid_status", "未支付"));
+        row.put("durationMinutes", rs.getInt("duration_minutes"));
+        row.put("queueNo", rs.getInt("queue_no"));
+        row.put("scheduledAt", String.valueOf(scheduledAt));
+        row.put("createdAt", String.valueOf(createdAtValue.toLocalDateTime()));
+        return row;
     }
 
     public static LocalDateTime parseSlotTime(String slot) {
