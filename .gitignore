@@ -2,12 +2,15 @@ HELP.md
 target/
 runtime/
 uploads/
+.venv/
+.venv-incomplete-*/
 /backend/
 *.log
 *.out.log
 *.err.log
 src/main/python/__pycache__/
 src/main/python/*.pyc
+src/test/python/__pycache__/
 .mvn/wrapper/maven-wrapper.jar
 !**/src/main/**/target/
 !**/src/test/**/target/

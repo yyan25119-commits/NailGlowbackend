@@ -199,10 +199,23 @@ public class AgentController {
         Map<String, Object> agentPayload = new LinkedHashMap<>(payload);
         agentPayload.put("mode", mode);
         agentPayload.put("context", context);
+        agentPayload.put("destination", destination);
+        agentPayload.put("styleName", styleName);
+        agentPayload.put("routeMode", String.valueOf(payload.getOrDefault("routeMode", "driving")));
+        if (StringUtils.hasText(origin)) {
+            agentPayload.put("origin", origin);
+        }
 
         Map<String, Object> agent = customerServiceAgentService.chat(agentPayload, toolCalls ->
                 executeCustomerToolCalls(toolCalls, userId, styleId <= 0 ? 1 : styleId, serviceName, context, appliedAppointment, supportCase, handoffState)
         );
+
+        Map<String, Object> delegatedRoute = mapValue(agent.get("delegatedRoute"));
+        boolean routeHandledByGraph = !delegatedRoute.isEmpty();
+        if (routeHandledByGraph) {
+            route = delegatedRoute;
+            agent.remove("delegatedRoute");
+        }
 
         boolean routeRequested = isRouteIntent(agent) || "route".equals(requestedMode);
         origin = firstText(payload, "origin", "start");
@@ -211,7 +224,9 @@ public class AgentController {
         }
         if (routeRequested) {
             mode = "route";
-            if (StringUtils.hasText(origin)) {
+            if (routeHandledByGraph) {
+                context.put("route", route);
+            } else if (StringUtils.hasText(origin)) {
                 Map<String, Object> routePayload = new LinkedHashMap<>(payload);
                 routePayload.put("origin", origin);
                 routePayload.put("destination", destination);
@@ -232,11 +247,13 @@ public class AgentController {
                 context.put("storeName", recommendedStore);
             }
             context.put("route", route);
-            agentPayload = new LinkedHashMap<>(payload);
-            agentPayload.put("mode", mode);
-            agentPayload.put("context", context);
-            agentPayload.put("disableTools", true);
-            agent = customerServiceAgentService.chat(agentPayload);
+            if (!routeHandledByGraph) {
+                agentPayload = new LinkedHashMap<>(payload);
+                agentPayload.put("mode", mode);
+                agentPayload.put("context", context);
+                agentPayload.put("disableTools", true);
+                agent = customerServiceAgentService.chat(agentPayload);
+            }
             if (StringUtils.hasText(String.valueOf(route.getOrDefault("summary", "")))) {
                 agent.put("answer", String.valueOf(route.get("summary")));
                 agent.put("intent", "route");

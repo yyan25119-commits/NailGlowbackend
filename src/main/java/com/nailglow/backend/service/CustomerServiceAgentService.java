@@ -38,6 +38,9 @@ public class CustomerServiceAgentService {
     @Value("${nailglow.customer-agent.timeout-seconds:35}")
     private long timeoutSeconds;
 
+    @Value("${nailglow.agent-graph.enabled:${AGENT_GRAPH_ENABLED:true}}")
+    private boolean agentGraphEnabled;
+
     public CustomerServiceAgentService(SystemSettingService systemSettingService) {
         this.systemSettingService = systemSettingService;
     }
@@ -163,7 +166,8 @@ public class CustomerServiceAgentService {
     }
 
     private Map<String, Object> runOnce(Map<String, Object> payload) {
-        Path scriptPath = Path.of("src", "main", "python", "customer_service_agent.py").toAbsolutePath().normalize();
+        String scriptName = agentGraphEnabled ? "agent_graph.py" : "customer_service_agent.py";
+        Path scriptPath = Path.of("src", "main", "python", scriptName).toAbsolutePath().normalize();
         if (!Files.exists(scriptPath)) {
             return fallback(payload, "未找到 Python 客服 Agent 脚本：" + scriptPath);
         }
