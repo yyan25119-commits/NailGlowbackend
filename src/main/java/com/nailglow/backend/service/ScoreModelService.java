@@ -14,6 +14,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
@@ -29,7 +30,7 @@ public class ScoreModelService {
     @Value("${nailglow.python.bin:${PYTHON_BIN:python}}")
     private String pythonBin;
 
-    @Value("${nailglow.score-model.timeout-seconds:30}")
+    @Value("${nailglow.score-model.timeout-seconds:60}")
     private long timeoutSeconds;
 
     @Value("${nailglow.score-model.use-mediapipe:true}")
@@ -68,6 +69,11 @@ public class ScoreModelService {
             }
             Map<String, Object> result = mapper.readValue(stdout, Map.class);
             result.put("source", modelPath.getFileName().toString());
+            result.putIfAbsent("scored", result.get("score") instanceof Number);
+            result.putIfAbsent("confidence", result.get("scored").equals(Boolean.TRUE) ? 0.45 : 0.0);
+            result.putIfAbsent("confidenceLevel", "LEGACY");
+            result.putIfAbsent("handProfile", Map.of());
+            result.putIfAbsent("reasons", List.of());
             return result;
         } catch (Exception ex) {
             return fallback("评分模型调用失败：" + ex.getMessage(), styleCode);
@@ -105,17 +111,17 @@ public class ScoreModelService {
 
     private Map<String, Object> fallback(String message, String styleCode) {
         Map<String, Object> result = new LinkedHashMap<>();
-        result.put("score", 86.0);
+        result.put("scored", false);
+        result.put("score", null);
+        result.put("confidence", 0.0);
+        result.put("confidenceLevel", "LOW");
         result.put("styleCode", styleCode);
         result.put("source", "fallback");
         result.put("message", message);
-        result.put("metrics", Map.of(
-                "手型适配度", 86,
-                "肤色显白度", 84,
-                "风格匹配度", 88,
-                "场景实用性", 82,
-                "整体美观度", 87
-        ));
+        result.put("metrics", Map.of());
+        result.put("handProfile", Map.of());
+        result.put("reasons", List.of("评分服务不可用，本次仅展示AI试穿结果，不生成虚假分数"));
+        result.put("modelSchemaVersion", "unscored-fallback");
         return result;
     }
 

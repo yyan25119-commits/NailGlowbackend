@@ -1,0 +1,89 @@
+{
+  "schemaVersion": "nailglow-score-v2",
+  "sampleCount": 900,
+  "groupCount": 180,
+  "questionnaireResponseCount": 6300,
+  "validationScore": 98.52,
+  "cvMetrics": {
+    "available": true,
+    "method": "GroupKFold(5)",
+    "groupKey": "handId/groupId",
+    "morphology": {
+      "perceived_length": {
+        "mae": 3.9046,
+        "rmse": 5.3369,
+        "r2": 0.8839,
+        "spearman": 0.9595
+      },
+      "perceived_slenderness": {
+        "mae": 5.7113,
+        "rmse": 7.1992,
+        "r2": 0.8285,
+        "spearman": 0.9326
+      },
+      "perceived_palm_width": {
+        "mae": 4.9403,
+        "rmse": 6.6398,
+        "r2": 0.8746,
+        "spearman": 0.9493
+      },
+      "perceived_softness": {
+        "mae": 4.8947,
+        "rmse": 6.619,
+        "r2": 0.8408,
+        "spearman": 0.95
+      }
+    },
+    "scores": {
+      "hand_fit": {
+        "mae": 1.9519,
+        "rmse": 2.5132,
+        "r2": 0.6795,
+        "spearman": 0.7677
+      },
+      "skin_tone": {
+        "mae": 2.4743,
+        "rmse": 3.092,
+        "r2": 0.7238,
+        "spearman": 0.84
+      },
+      "style_match": {
+        "mae": 1.9991,
+        "rmse": 2.4924,
+        "r2": 0.7449,
+        "spearman": 0.828
+      },
+      "scene_fit": {
+        "mae": 1.6767,
+        "rmse": 2.0919,
+        "r2": 0.8476,
+        "spearman": 0.8563
+      },
+      "aesthetic": {
+        "mae": 1.7657,
+        "rmse": 2.2332,
+        "r2": 0.5628,
+        "spearman": 0.7281
+      }
+    },
+    "overall": {
+      "mae": 1.4822,
+      "rmse": 1.8623,
+      "r2": 0.6156,
+      "spearman": 0.7596,
+      "ndcgAt3": 0.9956
+    }
+  },
+  "overallWeights": {
+    "hand_fit": 0.294646,
+    "skin_tone": 0.173265,
+    "style_match": 0.199005,
+    "scene_fit": 0.102211,
+    "aesthetic": 0.230874
+  },
+  "outputPath": "/Users/yuyan/工作/项目/NailGlow/backend/score_model.joblib",
+  "backupPath": "/Users/yuyan/工作/项目/NailGlow/backend/models/backups/score_model_pre_v2_20260827.joblib",
+  "featureCount": 56,
+  "createdAt": "2026-08-27T10:06:15.887950+00:00",
+  "synthetic": true
+}

@@ -36,6 +36,7 @@ import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -144,11 +145,16 @@ public class UserController {
                     return ApiResponse.fail(StringUtils.hasText(generation.message()) ? generation.message() : "AI 试穿生成失败，请稍后重试");
                 }
                 Map<String, Object> scoreResult = scoreModel.predict(tempImage, String.valueOf(style.getOrDefault("styleCode", "nail_01")));
-                int score = (int) Math.round(((Number) scoreResult.getOrDefault("score", 86)).doubleValue());
-                String metrics = metricsJson(scoreResult, score);
-                String advice = buildAdvice(styleName, score);
+                boolean scored = Boolean.TRUE.equals(scoreResult.get("scored"))
+                        && scoreResult.get("score") instanceof Number;
+                int score = scored ? (int) Math.round(((Number) scoreResult.get("score")).doubleValue()) : 0;
+                String metrics = metricsJson(scoreResult, score, scored);
+                String advice = scored
+                        ? buildAdvice(styleName, score)
+                        : String.valueOf(scoreResult.getOrDefault(
+                                "message", "当前手图质量不足，本次仅展示AI试穿结果，不生成适配分数"));
                 String resultImageUrl = generation.imageUrl();
-                results.add(resultPayload(style, score, resultImageUrl, advice, metrics, generation));
+                results.add(resultPayload(style, score, scored, resultImageUrl, advice, metrics, generation, scoreResult));
             }
         } finally {
             Files.deleteIfExists(tempImage);
@@ -161,12 +167,16 @@ public class UserController {
             return ApiResponse.fail("试穿生成失败，请稍后重试");
         }
 
-        Map<String, Object> bestResult = results.get(0);
+        Map<String, Object> bestResult = results.stream()
+                .max(Comparator
+                        .comparing((Map<String, Object> item) -> Boolean.TRUE.equals(item.get("scored")))
+                        .thenComparingInt(item -> item.get("score") instanceof Number number ? number.intValue() : 0))
+                .orElse(results.get(0));
         Map<String, Object> bestStyle = bestResult.get("style") instanceof Map<?, ?> styleMap
                 ? new LinkedHashMap<>((Map<String, Object>) styleMap)
                 : styles.get(0);
         String styleName = String.valueOf(bestStyle.get("name"));
-        int score = ((Number) bestResult.getOrDefault("score", 86)).intValue();
+        int score = bestResult.get("score") instanceof Number number ? number.intValue() : 0;
         String taskId = "tryon_" + UUID.randomUUID();
         String names = String.join(",", styles.stream().map(style -> String.valueOf(style.get("name"))).toList());
         String metrics = String.valueOf(bestResult.getOrDefault("metrics", ""));
@@ -240,13 +250,21 @@ public class UserController {
                        coalesce(avg(r.style_score), 0) as style_average,
                        coalesce(avg(r.scene_score), 0) as scene_average,
                        coalesce(avg(r.aesthetic_score), 0) as aesthetic_average,
+                       coalesce(avg(r.perceived_length_score), 0) as perceived_length_average,
+                       coalesce(avg(r.perceived_slenderness_score), 0) as perceived_slenderness_average,
+                       coalesce(avg(r.perceived_palm_width_score), 0) as perceived_palm_width_average,
+                       coalesce(avg(r.perceived_softness_score), 0) as perceived_softness_average,
                        count(r.id) as rating_count,
                        coalesce(max(case when r.user_id = ? then r.rating end), 0) as my_rating,
                        coalesce(max(case when r.user_id = ? then r.fit_score end), 0) as my_fit,
                        coalesce(max(case when r.user_id = ? then r.color_score end), 0) as my_color,
                        coalesce(max(case when r.user_id = ? then r.style_score end), 0) as my_style,
                        coalesce(max(case when r.user_id = ? then r.scene_score end), 0) as my_scene,
-                       coalesce(max(case when r.user_id = ? then r.aesthetic_score end), 0) as my_aesthetic
+                       coalesce(max(case when r.user_id = ? then r.aesthetic_score end), 0) as my_aesthetic,
+                       coalesce(max(case when r.user_id = ? then r.perceived_length_score end), 0) as my_perceived_length,
+                       coalesce(max(case when r.user_id = ? then r.perceived_slenderness_score end), 0) as my_perceived_slenderness,
+                       coalesce(max(case when r.user_id = ? then r.perceived_palm_width_score end), 0) as my_perceived_palm_width,
+                       coalesce(max(case when r.user_id = ? then r.perceived_softness_score end), 0) as my_perceived_softness
                 from customer_photos p
                 left join customer_photo_ratings r on r.photo_id = p.id
                 where p.status = 'approved'
@@ -279,8 +297,22 @@ public class UserController {
                     "scene", rs.getInt("my_scene"),
                     "aesthetic", rs.getInt("my_aesthetic")
             ));
+            row.put("morphologyAverages", Map.of(
+                    "perceivedLength", rs.getDouble("perceived_length_average"),
+                    "perceivedSlenderness", rs.getDouble("perceived_slenderness_average"),
+                    "perceivedPalmWidth", rs.getDouble("perceived_palm_width_average"),
+                    "perceivedSoftness", rs.getDouble("perceived_softness_average")
+            ));
+            row.put("myMorphologyDetail", Map.of(
+                    "perceivedLength", rs.getInt("my_perceived_length"),
+                    "perceivedSlenderness", rs.getInt("my_perceived_slenderness"),
+                    "perceivedPalmWidth", rs.getInt("my_perceived_palm_width"),
+                    "perceivedSoftness", rs.getInt("my_perceived_softness")
+            ));
             return row;
-        }, userId, userId, userId, userId, userId, userId, safeDays, safePageSize, offset);
+        }, userId, userId, userId, userId, userId, userId,
+                userId, userId, userId, userId,
+                safeDays, safePageSize, offset);
         return ApiResponse.ok(Map.of(
                 "list", list,
                 "total", total == null ? 0 : total,
@@ -312,15 +344,25 @@ public class UserController {
         int style = dimensionScore(payload, "styleMatchScore", "styleScore");
         int scene = dimensionScore(payload, "sceneScore", "sceneScore");
         int aesthetic = dimensionScore(payload, "aestheticScore", "aestheticScore");
+        Integer perceivedLength = optionalDimensionScore(payload, "perceivedLengthScore", "handLengthScore");
+        Integer perceivedSlenderness = optionalDimensionScore(payload, "perceivedSlendernessScore", "handSlendernessScore");
+        Integer perceivedPalmWidth = optionalDimensionScore(payload, "perceivedPalmWidthScore", "palmWidthScore");
+        Integer perceivedSoftness = optionalDimensionScore(payload, "perceivedSoftnessScore", "handSoftnessScore");
         int rating = clampInt(payload.getOrDefault("rating", Math.round((fit + color + style + scene + aesthetic) / 100.0f)), 1, 5);
         String comment = String.valueOf(payload.getOrDefault("comment", "")).trim();
         if (comment.length() > 200) {
             comment = comment.substring(0, 200);
         }
         jdbc.update("""
-                insert into customer_photo_ratings(photo_id, user_id, rating, fit_score, color_score, style_score, scene_score, aesthetic_score, comment)
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, id, userId, rating, fit, color, style, scene, aesthetic, comment);
+                insert into customer_photo_ratings(
+                  photo_id, user_id, rating, fit_score, color_score, style_score,
+                  scene_score, aesthetic_score, perceived_length_score,
+                  perceived_slenderness_score, perceived_palm_width_score,
+                  perceived_softness_score, comment
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, id, userId, rating, fit, color, style, scene, aesthetic,
+                perceivedLength, perceivedSlenderness, perceivedPalmWidth,
+                perceivedSoftness, comment);
         Map<String, Object> aggregate = ratingAggregate(id, userId);
         realtime.broadcast("customer_photos.changed", Map.of("photoId", id, "rating", true));
         return ApiResponse.ok(aggregate);
@@ -841,13 +883,21 @@ public class UserController {
                        coalesce(avg(style_score), 0) as style_average,
                        coalesce(avg(scene_score), 0) as scene_average,
                        coalesce(avg(aesthetic_score), 0) as aesthetic_average,
+                       coalesce(avg(perceived_length_score), 0) as perceived_length_average,
+                       coalesce(avg(perceived_slenderness_score), 0) as perceived_slenderness_average,
+                       coalesce(avg(perceived_palm_width_score), 0) as perceived_palm_width_average,
+                       coalesce(avg(perceived_softness_score), 0) as perceived_softness_average,
                        count(*) as rating_count,
                        coalesce(max(case when user_id = ? then rating end), 0) as my_rating,
                        coalesce(max(case when user_id = ? then fit_score end), 0) as my_fit,
                        coalesce(max(case when user_id = ? then color_score end), 0) as my_color,
                        coalesce(max(case when user_id = ? then style_score end), 0) as my_style,
                        coalesce(max(case when user_id = ? then scene_score end), 0) as my_scene,
-                       coalesce(max(case when user_id = ? then aesthetic_score end), 0) as my_aesthetic
+                       coalesce(max(case when user_id = ? then aesthetic_score end), 0) as my_aesthetic,
+                       coalesce(max(case when user_id = ? then perceived_length_score end), 0) as my_perceived_length,
+                       coalesce(max(case when user_id = ? then perceived_slenderness_score end), 0) as my_perceived_slenderness,
+                       coalesce(max(case when user_id = ? then perceived_palm_width_score end), 0) as my_perceived_palm_width,
+                       coalesce(max(case when user_id = ? then perceived_softness_score end), 0) as my_perceived_softness
                 from customer_photo_ratings
                 where photo_id = ?
                 """, (rs, rowNum) -> Map.of(
@@ -868,15 +918,30 @@ public class UserController {
                         "styleMatch", rs.getInt("my_style"),
                         "scene", rs.getInt("my_scene"),
                         "aesthetic", rs.getInt("my_aesthetic")
+                ),
+                "morphologyAverages", Map.of(
+                        "perceivedLength", rs.getDouble("perceived_length_average"),
+                        "perceivedSlenderness", rs.getDouble("perceived_slenderness_average"),
+                        "perceivedPalmWidth", rs.getDouble("perceived_palm_width_average"),
+                        "perceivedSoftness", rs.getDouble("perceived_softness_average")
+                ),
+                "myMorphologyDetail", Map.of(
+                        "perceivedLength", rs.getInt("my_perceived_length"),
+                        "perceivedSlenderness", rs.getInt("my_perceived_slenderness"),
+                        "perceivedPalmWidth", rs.getInt("my_perceived_palm_width"),
+                        "perceivedSoftness", rs.getInt("my_perceived_softness")
                 )
-        ), userId, userId, userId, userId, userId, userId, photoId);
+        ), userId, userId, userId, userId, userId, userId,
+                userId, userId, userId, userId, photoId);
         return rows.isEmpty() ? Map.of(
                 "photoId", photoId,
                 "ratingAverage", 0,
                 "ratingCount", 0,
                 "myRating", 0,
                 "dimensionAverages", Map.of("handFit", 0, "skinTone", 0, "styleMatch", 0, "scene", 0, "aesthetic", 0),
-                "myRatingDetail", Map.of("handFit", 0, "skinTone", 0, "styleMatch", 0, "scene", 0, "aesthetic", 0)
+                "myRatingDetail", Map.of("handFit", 0, "skinTone", 0, "styleMatch", 0, "scene", 0, "aesthetic", 0),
+                "morphologyAverages", Map.of("perceivedLength", 0, "perceivedSlenderness", 0, "perceivedPalmWidth", 0, "perceivedSoftness", 0),
+                "myMorphologyDetail", Map.of("perceivedLength", 0, "perceivedSlenderness", 0, "perceivedPalmWidth", 0, "perceivedSoftness", 0)
         ) : rows.get(0);
     }
 
@@ -892,6 +957,14 @@ public class UserController {
         Object value = payload.get(primaryKey);
         if (value == null) value = payload.get(legacyKey);
         if (value == null) value = payload.get("rating");
+        int parsed = clampInt(value, 0, 100);
+        return parsed <= 5 ? parsed * 20 : parsed;
+    }
+
+    private Integer optionalDimensionScore(Map<String, Object> payload, String primaryKey, String legacyKey) {
+        Object value = payload.get(primaryKey);
+        if (value == null) value = payload.get(legacyKey);
+        if (value == null || String.valueOf(value).isBlank()) return null;
         int parsed = clampInt(value, 0, 100);
         return parsed <= 5 ? parsed * 20 : parsed;
     }
@@ -915,13 +988,16 @@ public class UserController {
         }
     }
 
-    private String metricsJson(Map<String, Object> scoreResult, int score) {
+    private String metricsJson(Map<String, Object> scoreResult, int score, boolean scored) {
         Object metrics = scoreResult.get("metrics");
-        if (metrics != null) {
+        if (metrics instanceof Map<?, ?> metricMap && !metricMap.isEmpty()) {
             try {
                 return new tools.jackson.databind.ObjectMapper().writeValueAsString(normalizeMetricLabels(metrics));
             } catch (Exception ignored) {
             }
+        }
+        if (!scored) {
+            return "{}";
         }
         return "{\"手型适配度\":" + Math.min(98, score + 2)
                 + ",\"肤色显白度\":" + Math.max(70, score - 1)
@@ -972,13 +1048,23 @@ public class UserController {
         };
     }
 
-    private Map<String, Object> resultPayload(Map<String, Object> style, int score, String resultImageUrl,
-                                              String advice, String metrics, DoubaoImageService.GenerationResult generation) {
+    private Map<String, Object> resultPayload(Map<String, Object> style, int score, boolean scored,
+                                              String resultImageUrl, String advice, String metrics,
+                                              DoubaoImageService.GenerationResult generation,
+                                              Map<String, Object> scoreResult) {
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("style", style);
         data.put("styleId", style.get("id"));
         data.put("styleName", style.get("name"));
+        data.put("scored", scored);
         data.put("score", score);
+        data.put("confidence", scoreResult.getOrDefault("confidence", 0.0));
+        data.put("confidenceLevel", scoreResult.getOrDefault("confidenceLevel", "LOW"));
+        data.put("confidenceFactors", scoreResult.getOrDefault("confidenceFactors", Map.of()));
+        data.put("handProfile", scoreResult.getOrDefault("handProfile", Map.of()));
+        data.put("scoreReasons", scoreResult.getOrDefault("reasons", List.of()));
+        data.put("scoreModel", scoreResult.getOrDefault("source", scoreResult.getOrDefault("model", "unknown")));
+        data.put("scoreModelSchemaVersion", scoreResult.getOrDefault("modelSchemaVersion", "legacy-v1"));
         data.put("resultImageUrl", resultImageUrl);
         data.put("advice", advice);
         data.put("metrics", metrics);
@@ -996,6 +1082,14 @@ public class UserController {
         data.put("styles", styles);
         data.put("results", results);
         data.put("score", bestResult.get("score"));
+        data.put("scored", bestResult.get("scored"));
+        data.put("confidence", bestResult.get("confidence"));
+        data.put("confidenceLevel", bestResult.get("confidenceLevel"));
+        data.put("confidenceFactors", bestResult.get("confidenceFactors"));
+        data.put("handProfile", bestResult.get("handProfile"));
+        data.put("scoreReasons", bestResult.get("scoreReasons"));
+        data.put("scoreModel", bestResult.get("scoreModel"));
+        data.put("scoreModelSchemaVersion", bestResult.get("scoreModelSchemaVersion"));
         data.put("resultImageUrl", bestResult.get("resultImageUrl"));
         data.put("advice", bestResult.get("advice"));
         data.put("metrics", bestResult.get("metrics"));

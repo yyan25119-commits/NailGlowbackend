@@ -17,6 +17,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import tools.jackson.databind.ObjectMapper;
 
 import java.sql.Timestamp;
 import java.time.LocalDateTime;
@@ -31,6 +32,7 @@ import java.util.concurrent.CompletableFuture;
 @RequestMapping("/api/agent")
 public class AgentController {
     private static final DateTimeFormatter SERVER_TIME_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
+    private final ObjectMapper objectMapper = new ObjectMapper();
     private final RouteAgentService routeAgentService;
     private final CustomerServiceAgentService customerServiceAgentService;
     private final JdbcTemplate jdbc;
@@ -77,6 +79,18 @@ public class AgentController {
         CompletableFuture.runAsync(() -> {
             try {
                 Map<String, Object> data = customerChatData(userId, payload);
+                Object rawAgentEvents = data.get("agentEvents");
+                if (rawAgentEvents instanceof List<?> agentEvents) {
+                    for (Object event : agentEvents) {
+                        emitter.send(SseEmitter.event().name("agent").data(event, MediaType.APPLICATION_JSON));
+                        try {
+                            Thread.sleep(90L);
+                        } catch (InterruptedException interrupted) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
+                    }
+                }
                 String answer = String.valueOf(data.getOrDefault("answer", ""));
                 for (String chunk : splitAnswerForStreaming(answer)) {
                     emitter.send(SseEmitter.event().name("delta").data(Map.of("content", chunk), MediaType.APPLICATION_JSON));
@@ -159,6 +173,25 @@ public class AgentController {
         context.put("amount", amount);
         context.put("route", route);
         context.put("appointment", appointment);
+        context.put("styleName", styleName);
+        context.put("styleCandidates", recommendationStyleCandidates());
+        context.put("handProfile", mapValue(payload.get("handProfile")));
+        context.put("scoreMetrics", mapValue(payload.get("scoreMetrics")));
+        context.put("scoreReasons", payload.get("scoreReasons") instanceof List<?> list ? list : List.of());
+        context.put("tryOnScore", payload.getOrDefault("tryOnScore", 0));
+        context.put("confidence", payload.getOrDefault("confidence", 0));
+        context.put("storeCandidates", buildStoreCandidates(scheduledAt, duration, styleName, amount));
+        Map<String, Object> requestContext = mapValue(payload.get("context"));
+        Map<String, Object> requestSessionState = mapValue(requestContext.get("agentSessionState"));
+        Map<String, Object> persistedSessionState = mapValue(previousAgentState.get("agentSessionState"));
+        // The database is authoritative across page refreshes and browser tabs.
+        // The client copy is only a fallback for a brand-new conversation.
+        Map<String, Object> agentSessionState = persistedSessionState.isEmpty()
+                ? requestSessionState
+                : persistedSessionState;
+        if (!agentSessionState.isEmpty()) {
+            context.put("agentSessionState", agentSessionState);
+        }
         Map<String, Object> pendingAction = mapValue(previousAgentState.get("pendingAction"));
         if (!pendingAction.isEmpty()) {
             context.put("pendingAction", pendingAction);
@@ -174,12 +207,19 @@ public class AgentController {
         ));
 
         Map<String, Object> appliedAppointment = new LinkedHashMap<>();
-        if (autoBook) {
+        String normalizedUserText = userText.toLowerCase();
+        boolean fulfillmentOwnsAutoBook = List.of("route", "fulfillment", "mobility").contains(mode)
+                || pendingAction.containsKey("storeId")
+                || pendingAction.containsKey("storeName")
+                || List.of("哪家店", "附近门店", "赶得上", "能不能做完", "路线", "导航")
+                .stream().anyMatch(normalizedUserText::contains);
+        if (autoBook && !fulfillmentOwnsAutoBook) {
             Map<String, Object> created = createOrRescheduleAppointment(
                     0L,
                     userId,
                     styleId <= 0 ? 1 : styleId,
                     serviceName,
+                    "NailGlow 市中心旗舰店",
                     scheduledAt,
                     recommendedSlot,
                     "fixed"
@@ -201,6 +241,7 @@ public class AgentController {
         agentPayload.put("context", context);
         agentPayload.put("destination", destination);
         agentPayload.put("styleName", styleName);
+        agentPayload.put("autoBook", autoBook);
         agentPayload.put("routeMode", String.valueOf(payload.getOrDefault("routeMode", "driving")));
         if (StringUtils.hasText(origin)) {
             agentPayload.put("origin", origin);
@@ -293,11 +334,15 @@ public class AgentController {
             agent.putIfAbsent("handoffReason", "AI 已判断该问题需要人工客服介入");
         }
 
+        // The model result is an internal protocol. Never persist or stream a
+        // raw protocol object as if it were a customer-facing answer.
+        agent.put("answer", normalizePublicAnswer(agent.get("answer"), agent));
+
         long conversationId = supportService.recordChat(userId, mode, userText, agent, context);
 
         Map<String, Object> data = new LinkedHashMap<>(context);
         data.put("conversationId", conversationId);
-        data.put("answer", String.valueOf(agent.getOrDefault("answer", "你好，我是 NailGlow 智能客服。")));
+        data.put("answer", normalizePublicAnswer(agent.getOrDefault("answer", ""), agent));
         data.put("managedBy", handoffRequested ? "human" : "ai");
         data.put("handoffRequested", handoffRequested);
         data.put("handoffStatus", handoffRequested ? "requested" : "ai");
@@ -305,6 +350,20 @@ public class AgentController {
         data.put("intent", agent.getOrDefault("intent", mode));
         data.put("quickReplies", agent.getOrDefault("quickReplies", List.of("售前服务", "售后服务", "查看排队", "采纳并预约")));
         data.put("agentSource", agent.getOrDefault("agentSource", "customer_agent"));
+        data.put("specialistAgent", agent.getOrDefault("specialistAgent", "customer_agent"));
+        data.put("activeAgent", agent.getOrDefault("activeAgent", agent.getOrDefault("specialistAgent", "customer_agent")));
+        data.put("responseAgent", agent.getOrDefault("responseAgent", agent.getOrDefault("specialistAgent", "customer_agent")));
+        data.put("responseAgentName", agent.getOrDefault("responseAgentName", "客服接待 Agent"));
+        data.put("agentSessionState", agent.getOrDefault("agentSessionState", Map.of()));
+        data.put("specialistState", agent.getOrDefault("specialistState", Map.of()));
+        data.put("agentEvents", agent.getOrDefault("agentEvents", List.of()));
+        data.put("agentRegistry", agent.getOrDefault("agentRegistry", List.of()));
+        data.put("orchestration", agent.getOrDefault("orchestration", "customer_agent"));
+        data.put("ragSources", agent.getOrDefault("ragSources", List.of()));
+        data.put("ragRetrievalMode", agent.getOrDefault("ragRetrievalMode", ""));
+        data.put("recommendedStyles", agent.getOrDefault("recommendedStyles", List.of()));
+        data.put("recommendationReasons", agent.getOrDefault("recommendationReasons", List.of()));
+        data.put("missingPreferences", agent.getOrDefault("missingPreferences", List.of()));
         data.put("merchantFeedback", agent.getOrDefault("merchantFeedback", null));
         data.put("severity", agent.getOrDefault("severity", "low"));
         data.put("category", agent.getOrDefault("category", "其他"));
@@ -320,6 +379,58 @@ public class AgentController {
         data.put("amount", amount);
         data.put("appointment", appointment);
         return data;
+    }
+
+    private String normalizePublicAnswer(Object rawAnswer, Map<String, Object> agent) {
+        String text = rawAnswer == null ? "" : String.valueOf(rawAnswer).replace("\u0000", "").trim();
+        if (text.isBlank()) {
+            return publicAnswerFallback(String.valueOf(agent.getOrDefault("intent", "general")));
+        }
+        boolean protocolLike = text.startsWith("{")
+                || text.startsWith("```")
+                || text.contains("\"intent\"") && text.contains("\"toolCalls\"");
+        Map<String, Object> nested = extractStructuredAnswer(text);
+        if (protocolLike && !nested.isEmpty()) {
+            String nestedAnswer = String.valueOf(nested.getOrDefault("answer", nested.getOrDefault("summary", ""))).trim();
+            if (!nestedAnswer.isBlank() && extractStructuredAnswer(nestedAnswer).isEmpty()) {
+                return nestedAnswer.substring(0, Math.min(4000, nestedAnswer.length()));
+            }
+            return publicAnswerFallback(String.valueOf(nested.getOrDefault("intent", agent.getOrDefault("intent", "general"))));
+        }
+        if (protocolLike) {
+            return publicAnswerFallback(String.valueOf(agent.getOrDefault("intent", "general")));
+        }
+        return text.substring(0, Math.min(4000, text.length()));
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> extractStructuredAnswer(String text) {
+        String trimmed = text.trim();
+        if (!(trimmed.startsWith("{") || trimmed.startsWith("```")
+                || trimmed.contains("\"intent\"") && trimmed.contains("\"toolCalls\""))) {
+            return Map.of();
+        }
+        int start = trimmed.indexOf('{');
+        int end = trimmed.lastIndexOf('}');
+        if (start < 0 || end <= start) return Map.of();
+        try {
+            Map<?, ?> parsed = objectMapper.readValue(trimmed.substring(start, end + 1), Map.class);
+            Map<String, Object> result = new LinkedHashMap<>();
+            parsed.forEach((key, value) -> result.put(String.valueOf(key), value));
+            return result;
+        } catch (Exception ignored) {
+            return Map.of();
+        }
+    }
+
+    private String publicAnswerFallback(String intent) {
+        return switch (intent.trim().toLowerCase()) {
+            case "presale", "recommendation", "beauty" -> "我已经整理好你的美甲需求，请继续告诉我肤色、手型或使用场景。";
+            case "route", "fulfillment", "mobility" -> "我正在整理门店、出行路线和到店时间，请提供出发地。";
+            case "aftersale", "support", "complaint" -> "我可以帮你记录售后问题，请补充具体情况和发生时间。";
+            case "appointment", "queue", "booking" -> "我可以帮你查询或调整预约，请告诉我希望到店的时间。";
+            default -> "我已经收到你的问题，请告诉我想咨询的具体内容。";
+        };
     }
 
     private String resolveStyleName(long styleId, String fallback) {
@@ -398,6 +509,10 @@ public class AgentController {
         Map<String, Object> currentAppointment = mapValue(context.get("appointment"));
         long appointmentId = longValue(currentAppointment.get("id"));
         String action = String.valueOf(arguments.getOrDefault("action", "create"));
+        String selectedStoreName = firstText(arguments, "storeName");
+        if (!StringUtils.hasText(selectedStoreName)) {
+            selectedStoreName = String.valueOf(context.getOrDefault("storeName", "NailGlow 市中心旗舰店"));
+        }
         boolean hasActiveAppointment = appointmentId > 0;
         if ("create".equals(action) && hasActiveAppointment) {
             String currentSlot = firstText(currentAppointment, "slotTimeAdmin", "slotTimeUser", "slotTime");
@@ -425,6 +540,7 @@ public class AgentController {
                 userId,
                 styleId,
                 serviceName,
+                selectedStoreName,
                 scheduledAt,
                 "fixed".equals(slotKind) ? fixedSlotLabel : requestedLabel,
                 slotKind
@@ -498,6 +614,7 @@ public class AgentController {
                                                               long userId,
                                                               long styleId,
                                                               String serviceName,
+                                                              String storeName,
                                                               LocalDateTime scheduledAt,
                                                               String userFacingSlotText,
                                                               String slotKind) {
@@ -508,19 +625,22 @@ public class AgentController {
         int amount = UserController.servicePrice(serviceName);
         int duration = UserController.serviceDuration(serviceName);
         long resolvedAppointmentId = resolveActiveAppointmentId(userId, appointmentId);
-        int queueNo = nextQueueNo(scheduledAt, resolvedAppointmentId);
+        String effectiveStoreName = StringUtils.hasText(storeName) ? storeName : "NailGlow 市中心旗舰店";
+        int queueNo = nextQueueNo(scheduledAt, resolvedAppointmentId, effectiveStoreName);
         if (resolvedAppointmentId > 0) {
             jdbc.update("""
                     update appointments
-                    set style_id = ?, service_name = ?, slot_time = ?, scheduled_at = ?, store_name = 'NailGlow 市中心旗舰店',
+                    set style_id = ?, service_name = ?, slot_time = ?, scheduled_at = ?, store_name = ?,
                         status = '已确认', amount = ?, paid_status = '未支付', duration_minutes = ?, queue_no = ?
                     where id = ? and user_id = ?
-                    """, styleId, serviceName, slotTime, Timestamp.valueOf(scheduledAt), amount, duration, queueNo, resolvedAppointmentId, userId);
+                    """, styleId, serviceName, slotTime, Timestamp.valueOf(scheduledAt), effectiveStoreName,
+                    amount, duration, queueNo, resolvedAppointmentId, userId);
         } else {
             jdbc.update("""
                     insert into appointments(user_id, style_id, service_name, slot_time, scheduled_at, store_name, status, amount, paid_status, duration_minutes, queue_no)
-                    values (?, ?, ?, ?, ?, 'NailGlow 市中心旗舰店', '已确认', ?, '未支付', ?, ?)
-                    """, userId, styleId, serviceName, slotTime, Timestamp.valueOf(scheduledAt), amount, duration, queueNo);
+                    values (?, ?, ?, ?, ?, ?, '已确认', ?, '未支付', ?, ?)
+                    """, userId, styleId, serviceName, slotTime, Timestamp.valueOf(scheduledAt), effectiveStoreName,
+                    amount, duration, queueNo);
             resolvedAppointmentId = jdbc.queryForObject("select last_insert_id()", Long.class);
         }
         cancelOtherActiveAppointments(userId, resolvedAppointmentId);
@@ -535,6 +655,7 @@ public class AgentController {
         result.put("scheduledAt", String.valueOf(scheduledAt));
         result.put("slotKind", slotKind);
         result.put("serviceName", serviceName);
+        result.put("storeName", effectiveStoreName);
         result.put("amount", amount);
         result.put("durationMinutes", duration);
         result.put("queueNo", queueNo);
@@ -568,6 +689,7 @@ public class AgentController {
             row.put("queueNo", rs.getInt("queue_no"));
             row.put("paidStatus", rs.getString("paid_status"));
             row.put("serviceName", rs.getString("service_name"));
+            row.put("storeName", rs.getString("store_name"));
             row.put("slotKind", rawSlotTime != null && (rawSlotTime.startsWith("今天") || rawSlotTime.startsWith("明天") || rawSlotTime.startsWith("后天")) ? "fixed" : "custom");
             return row;
         }, userId);
@@ -652,6 +774,94 @@ public class AgentController {
         return chunks;
     }
 
+    private List<Map<String, Object>> buildStoreCandidates(LocalDateTime preferredStart,
+                                                            int serviceDurationMinutes,
+                                                            String styleName,
+                                                            int baseAmount) {
+        List<Map<String, Object>> catalog = List.of(
+                store("store_a", "NailGlow 市中心旗舰店", "南昌市东湖区八一广场商圈",
+                        "115.903632,28.676735", 2, 8, "商圈停车位紧张，建议地铁出行", 4.8, 18),
+                store("store_b", "NailGlow 红谷滩万象城店", "南昌市红谷滩区万象城 L3",
+                        "115.858734,28.682892", 4, 6, "万象城地下停车场，消费可抵扣部分停车费", 4.2, 14),
+                store("store_c", "NailGlow 朝阳新城店", "南昌市西湖区朝阳新城天虹",
+                        "115.857236,28.640152", 5, 4, "天虹停车场，工作日下午余位较多", 7.1, 20)
+        );
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (int index = 0; index < catalog.size(); index++) {
+            Map<String, Object> store = new LinkedHashMap<>(catalog.get(index));
+            int capacity = intValue(store.get("capacity"));
+            List<String> slots = new ArrayList<>();
+            for (int offset = 0; offset <= 4; offset++) {
+                LocalDateTime candidate = preferredStart.plusMinutes(offset * 60L);
+                Integer occupied = jdbc.queryForObject("""
+                        select count(*) from appointments
+                        where status in ('已确认', '待到店')
+                          and store_name = ?
+                          and scheduled_at is not null
+                          and abs(timestampdiff(minute, scheduled_at, ?)) < ?
+                        """, Integer.class, store.get("storeName"), Timestamp.valueOf(candidate),
+                        Math.max(45, serviceDurationMinutes));
+                if ((occupied == null ? 0 : occupied) < capacity) {
+                    slots.add(candidate.withSecond(0).withNano(0).toString());
+                }
+            }
+            store.put("availableSlots", slots);
+            store.put("supportsStyle", true);
+            store.put("supportedStyles", List.of(styleName, "显白通勤款", "法式", "猫眼", "短甲"));
+            store.put("baseServicePrice", baseAmount + index * 12);
+            store.put("serviceDurationMinutes", serviceDurationMinutes);
+            result.add(store);
+        }
+        return result;
+    }
+
+    private List<Map<String, Object>> recommendationStyleCandidates() {
+        return jdbc.query("""
+                select id, style_code, name, tags, description, avg_score, try_count
+                from nail_styles
+                where status = '上架'
+                order by avg_score desc, try_count desc
+                limit 8
+                """, (rs, rowNum) -> {
+            Map<String, Object> style = new LinkedHashMap<>();
+            style.put("styleId", rs.getLong("id"));
+            style.put("styleCode", rs.getString("style_code"));
+            style.put("name", rs.getString("name"));
+            style.put("tags", rs.getString("tags"));
+            style.put("description", rs.getString("description"));
+            style.put("averageScore", rs.getDouble("avg_score"));
+            style.put("tryCount", rs.getInt("try_count"));
+            return style;
+        });
+    }
+
+    private Map<String, Object> store(String id,
+                                      String name,
+                                      String address,
+                                      String location,
+                                      int capacity,
+                                      int parkingFeePerHour,
+                                      String parkingNote,
+                                      double distanceKm,
+                                      int drivingMinutes) {
+        Map<String, Object> store = new LinkedHashMap<>();
+        store.put("storeId", id);
+        store.put("storeName", name);
+        store.put("name", name);
+        store.put("storeAddress", address);
+        store.put("address", address);
+        store.put("location", location);
+        store.put("adcode", "360100");
+        store.put("capacity", capacity);
+        store.put("parkingAvailable", true);
+        store.put("parkingFeePerHour", parkingFeePerHour);
+        store.put("parkingNote", parkingNote);
+        store.put("distanceKm", distanceKm);
+        store.put("drivingMinutes", drivingMinutes);
+        store.put("transitMinutes", drivingMinutes + 14);
+        return store;
+    }
+
     private String recommendSlot() {
         List<String> slots = List.of("今天 15:30", "今天 18:00", "明天 10:30", "明天 14:00");
         for (String slot : slots) {
@@ -679,13 +889,14 @@ public class AgentController {
         return count == null ? 0 : count;
     }
 
-    private int nextQueueNo(LocalDateTime scheduledAt, long excludeAppointmentId) {
+    private int nextQueueNo(LocalDateTime scheduledAt, long excludeAppointmentId, String storeName) {
         Integer count = jdbc.queryForObject("""
                 select count(*) from appointments
                 where status in ('已确认', '待到店')
                   and date(coalesce(scheduled_at, created_at)) = date(?)
                   and id <> ?
-                """, Integer.class, Timestamp.valueOf(scheduledAt), excludeAppointmentId);
+                  and store_name = ?
+                """, Integer.class, Timestamp.valueOf(scheduledAt), excludeAppointmentId, storeName);
         return (count == null ? 0 : count) + 1;
     }
 

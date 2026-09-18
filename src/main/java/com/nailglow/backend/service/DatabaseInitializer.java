@@ -79,6 +79,10 @@ public class DatabaseInitializer implements CommandLineRunner {
                   style_score int,
                   scene_score int,
                   aesthetic_score int,
+                  perceived_length_score int,
+                  perceived_slenderness_score int,
+                  perceived_palm_width_score int,
+                  perceived_softness_score int,
                   comment varchar(200),
                   created_at timestamp not null default current_timestamp,
                   updated_at timestamp not null default current_timestamp on update current_timestamp,
@@ -94,7 +98,12 @@ public class DatabaseInitializer implements CommandLineRunner {
                   file_path varchar(800) not null,
                   status varchar(24) not null default 'candidate',
                   sample_count int not null default 0,
+                  group_count int not null default 0,
+                  questionnaire_response_count int not null default 0,
                   validation_score decimal(8,4) not null default 0,
+                  schema_version varchar(64) not null default 'legacy-v1',
+                  dataset_source varchar(40) not null default 'unknown',
+                  metrics_json longtext,
                   file_size bigint not null default 0,
                   created_at timestamp not null default current_timestamp,
                   activated_at timestamp null,
@@ -275,9 +284,18 @@ public class DatabaseInitializer implements CommandLineRunner {
         addColumnIfMissing("alter table customer_photo_ratings add column style_score int after color_score");
         addColumnIfMissing("alter table customer_photo_ratings add column scene_score int after style_score");
         addColumnIfMissing("alter table customer_photo_ratings add column aesthetic_score int after scene_score");
+        addColumnIfMissing("alter table customer_photo_ratings add column perceived_length_score int after aesthetic_score");
+        addColumnIfMissing("alter table customer_photo_ratings add column perceived_slenderness_score int after perceived_length_score");
+        addColumnIfMissing("alter table customer_photo_ratings add column perceived_palm_width_score int after perceived_slenderness_score");
+        addColumnIfMissing("alter table customer_photo_ratings add column perceived_softness_score int after perceived_palm_width_score");
         addColumnIfMissing("alter table customer_photo_ratings add column comment varchar(200) after style_score");
         addColumnIfMissing("alter table score_model_versions add column sample_count int not null default 0 after status");
-        addColumnIfMissing("alter table score_model_versions add column validation_score decimal(8,4) not null default 0 after sample_count");
+        addColumnIfMissing("alter table score_model_versions add column group_count int not null default 0 after sample_count");
+        addColumnIfMissing("alter table score_model_versions add column questionnaire_response_count int not null default 0 after group_count");
+        addColumnIfMissing("alter table score_model_versions add column validation_score decimal(8,4) not null default 0 after questionnaire_response_count");
+        addColumnIfMissing("alter table score_model_versions add column schema_version varchar(64) not null default 'legacy-v1' after validation_score");
+        addColumnIfMissing("alter table score_model_versions add column dataset_source varchar(40) not null default 'unknown' after schema_version");
+        addColumnIfMissing("alter table score_model_versions add column metrics_json longtext after dataset_source");
         addColumnIfMissing("alter table score_model_versions add column file_size bigint not null default 0 after validation_score");
         addColumnIfMissing("alter table try_on_tasks add column results_json longtext after metrics_json");
         addColumnIfMissing("alter table appointments add column scheduled_at timestamp null after slot_time");
@@ -460,9 +478,16 @@ public class DatabaseInitializer implements CommandLineRunner {
         }
         Integer sampleCount = jdbc.queryForObject("select count(*) from customer_photo_ratings", Integer.class);
         jdbc.update("""
-                insert into score_model_versions(version_name, file_path, status, sample_count, validation_score, file_size, created_at, activated_at)
-                values ('score_model.joblib', ?, 'active', ?, 0, ?, current_timestamp, current_timestamp)
-                """, path.toString(), sampleCount == null ? 0 : sampleCount, size);
+                insert into score_model_versions(
+                  version_name, file_path, status, sample_count, group_count,
+                  questionnaire_response_count, validation_score, schema_version,
+                  dataset_source, metrics_json, file_size, created_at, activated_at
+                ) values (
+                  'score_model.joblib', ?, 'active', ?, 0, ?, 0, 'legacy-v1',
+                  'bootstrap', '{}', ?, current_timestamp, current_timestamp
+                )
+                """, path.toString(), sampleCount == null ? 0 : sampleCount,
+                sampleCount == null ? 0 : sampleCount, size);
     }
 
     private void seedSettings() {

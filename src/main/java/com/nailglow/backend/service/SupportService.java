@@ -114,6 +114,7 @@ public class SupportService {
             Map<String, Object> metadata = parseMap(rs.getString("metadata_json"));
             row.put("metadata", metadata);
             row.put("navigationUrl", navigationUrl(metadata));
+            row.put("ragSources", ragSources(metadata));
             row.put("createdAt", String.valueOf(rs.getTimestamp("created_at").toLocalDateTime()));
             return row;
         }, conversationId);
@@ -158,7 +159,8 @@ public class SupportService {
     }
 
     public Map<String, Object> latestAssistantAgentState(long userId, long conversationId) {
-        Map<String, Object> conversation = conversationForUser(userId, conversationId);
+        long resolvedConversationId = conversationId > 0 ? conversationId : findOrCreateConversation(userId);
+        Map<String, Object> conversation = conversationForUser(userId, resolvedConversationId);
         if (conversation.isEmpty()) {
             return Map.of();
         }
@@ -169,7 +171,7 @@ public class SupportService {
                   and role = 'assistant'
                 order by created_at desc, id desc
                 limit 1
-                """, (rs, rowNum) -> parseMap(rs.getString("metadata_json")), conversationId);
+                """, (rs, rowNum) -> parseMap(rs.getString("metadata_json")), resolvedConversationId);
         if (rows.isEmpty()) {
             return Map.of();
         }
@@ -467,5 +469,16 @@ public class SupportService {
             }
         }
         return "";
+    }
+
+    private List<Object> ragSources(Map<String, Object> metadata) {
+        Object agent = metadata.get("agent");
+        if (agent instanceof Map<?, ?> agentMap) {
+            Object sources = agentMap.get("ragSources");
+            if (sources instanceof List<?> list) {
+                return new ArrayList<>(list);
+            }
+        }
+        return List.of();
     }
 }

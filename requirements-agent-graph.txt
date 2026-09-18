@@ -1,2 +1,3 @@
 langgraph>=1.0,<2
 pydantic>=2.7,<3
+pymilvus[milvus-lite]>=2.5,<3.1

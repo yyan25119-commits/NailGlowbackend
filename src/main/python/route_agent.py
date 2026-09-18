@@ -10,6 +10,7 @@ import re
 import sys
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -28,6 +29,7 @@ ARK_API_KEY = (
 )
 ARK_MODEL = os.getenv("ROUTE_AGENT_MODEL") or os.getenv("ARK_MODEL") or os.getenv("AI_MODEL") or "doubao-seed-2-0-pro-260215"
 AMAP_KEY = os.getenv("AMAP_WEB_SERVICE_KEY") or os.getenv("AMAP_KEY") or ""
+AMAP_WEATHER_URL = "https://restapi.amap.com/v3/weather/weatherInfo"
 TIMEOUT_SECONDS = float(os.getenv("ROUTE_AGENT_TIMEOUT_SECONDS", "20"))
 MAX_TOOL_STEPS = int(os.getenv("ROUTE_AGENT_MAX_TOOL_STEPS", "4"))
 COORD_RE = re.compile(r"^\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*$")
@@ -37,25 +39,40 @@ MOCK_STORES = [
         "name": "NailGlow 红谷滩万象城店",
         "address": "南昌市红谷滩区万象城 L3",
         "district": "红谷滩",
+        "adcode": "360100",
         "location": "115.858734,28.682892",
         "supportedStyles": ["显白通勤款", "法式", "冰透", "短甲"],
         "nextSlot": "今天 16:30",
+        "capacity": 4,
+        "parkingAvailable": True,
+        "parkingFeePerHour": 6,
+        "parkingNote": "万象城地下停车场，消费可抵扣部分停车费",
     },
     {
         "name": "NailGlow 八一广场旗舰店",
         "address": "南昌市东湖区八一广场商圈",
         "district": "东湖",
+        "adcode": "360100",
         "location": "115.903632,28.676735",
         "supportedStyles": ["猫眼", "高级感", "法式"],
         "nextSlot": "今天 17:00",
+        "capacity": 3,
+        "parkingAvailable": True,
+        "parkingFeePerHour": 8,
+        "parkingNote": "商圈停车位紧张，建议地铁出行",
     },
     {
         "name": "NailGlow 朝阳新城店",
         "address": "南昌市西湖区朝阳新城天虹",
         "district": "西湖",
+        "adcode": "360100",
         "location": "115.857236,28.640152",
         "supportedStyles": ["显白通勤款", "猫眼", "短甲"],
         "nextSlot": "今天 18:00",
+        "capacity": 5,
+        "parkingAvailable": True,
+        "parkingFeePerHour": 4,
+        "parkingNote": "天虹停车场，工作日下午余位较多",
     },
 ]
 
@@ -356,6 +373,462 @@ def mock_route_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def parse_server_time(payload: Dict[str, Any]) -> datetime:
+    context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+    raw = payload.get("currentServerTime") or context.get("currentServerTime")
+    for pattern in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(str(raw or ""), pattern)
+        except ValueError:
+            continue
+    return datetime.now().replace(second=0, microsecond=0)
+
+
+def parse_datetime_text(value: Any, now: datetime) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        pass
+    day_offset = 2 if "后天" in text else 1 if "明天" in text else 0
+    match = re.search(r"(上午|中午|下午|晚上)?\s*(\d{1,2})(?:[:点时](\d{1,2})?|点半)", text)
+    if not match:
+        return None
+    period, hour_text, minute_text = match.groups()
+    hour = int(hour_text)
+    minute = 30 if "点半" in match.group(0) else int(minute_text or 0)
+    if period in {"下午", "晚上"} and hour < 12:
+        hour += 12
+    if period == "中午" and hour < 11:
+        hour += 12
+    try:
+        candidate = (now + timedelta(days=day_offset)).replace(hour=hour, minute=minute, second=0, microsecond=0)
+    except ValueError:
+        return None
+    if day_offset == 0 and candidate < now - timedelta(minutes=5):
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def extract_time_constraints(payload: Dict[str, Any]) -> Dict[str, Any]:
+    now = parse_server_time(payload)
+    context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+    message = str(payload.get("message") or payload.get("query") or "")
+    requested_start = parse_datetime_text(
+        payload.get("requestedStart")
+        or payload.get("preferredSlot")
+        or context.get("recommendedSlot"),
+        now,
+    )
+    deadline = parse_datetime_text(
+        payload.get("finishBy") or payload.get("deadline") or payload.get("mustFinishBy"),
+        now,
+    )
+    found = [parse_datetime_text(match.group(0), now) for match in re.finditer(
+        r"(?:今天|明天|后天)?\s*(?:上午|中午|下午|晚上)?\s*\d{1,2}(?::\d{1,2}|点半|点\d{0,2}分?)",
+        message,
+    )]
+    found = [item for item in found if item is not None]
+    if requested_start is None and found:
+        requested_start = found[0]
+    if deadline is None:
+        if len(found) >= 2:
+            deadline = max(found)
+        elif found and any(token in message for token in ("之前", "有事", "做完", "搞定", "结束")):
+            deadline = found[-1]
+    return {
+        "now": now,
+        "requestedStart": requested_start,
+        "finishBy": deadline,
+    }
+
+
+def candidate_stores(payload: Dict[str, Any], now: datetime) -> List[Dict[str, Any]]:
+    configured = payload.get("storeCandidates")
+    if not isinstance(configured, list):
+        context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+        configured = context.get("storeCandidates")
+    if isinstance(configured, list) and configured:
+        return [dict(item) for item in configured if isinstance(item, dict)]
+
+    stores = []
+    for index, store in enumerate(mock_store_candidates(payload)):
+        first_slot = parse_datetime_text(store.get("nextSlot"), now) or now + timedelta(hours=2 + index)
+        candidate = {
+            **store,
+            "storeId": f"demo_store_{index + 1}",
+            "availableSlots": [
+                first_slot.isoformat(timespec="seconds"),
+                (first_slot + timedelta(hours=2)).isoformat(timespec="seconds"),
+            ],
+            "baseServicePrice": 268 + index * 12,
+        }
+        if payload.get("weather"):
+            candidate["weather"] = payload.get("weather")
+        stores.append(candidate)
+    return stores
+
+
+def fetch_weather_for_store(
+    payload: Dict[str, Any],
+    store: Dict[str, Any],
+    cache: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Return normalized live weather, with an explicit demo fallback."""
+
+    configured = store.get("weather") or payload.get("weather")
+    if isinstance(configured, dict):
+        return {
+            "weather": str(configured.get("weather") or configured.get("condition") or "多云"),
+            "temperature": str(configured.get("temperature") or "28"),
+            "windDirection": str(configured.get("windDirection") or configured.get("winddirection") or "东南"),
+            "windPower": str(configured.get("windPower") or configured.get("windpower") or "3"),
+            "humidity": str(configured.get("humidity") or "62"),
+            "reportTime": str(configured.get("reportTime") or configured.get("reporttime") or ""),
+            "source": str(configured.get("source") or "payload"),
+        }
+
+    adcode = str(store.get("adcode") or payload.get("weatherAdcode") or "360100")
+    weather_cache = cache if cache is not None else {}
+    if adcode in weather_cache:
+        return dict(weather_cache[adcode])
+
+    if AMAP_KEY:
+        try:
+            response = http_json(
+                "GET",
+                AMAP_WEATHER_URL,
+                params={"key": AMAP_KEY, "city": adcode, "extensions": "base", "output": "JSON"},
+            )
+            lives = response.get("lives") if isinstance(response.get("lives"), list) else []
+            live = first(lives)
+            if str(response.get("status") or "") == "1" and live:
+                normalized = {
+                    "weather": str(live.get("weather") or "未知"),
+                    "temperature": str(live.get("temperature") or ""),
+                    "windDirection": str(live.get("winddirection") or ""),
+                    "windPower": str(live.get("windpower") or ""),
+                    "humidity": str(live.get("humidity") or ""),
+                    "reportTime": str(live.get("reporttime") or ""),
+                    "province": str(live.get("province") or ""),
+                    "city": str(live.get("city") or ""),
+                    "adcode": str(live.get("adcode") or adcode),
+                    "source": "amap_live",
+                }
+                weather_cache[adcode] = normalized
+                return dict(normalized)
+        except Exception:
+            pass
+
+    fallback_text = str(configured or payload.get("mockWeather") or "多云")
+    fallback = {
+        "weather": fallback_text,
+        "temperature": str(payload.get("mockTemperature") or "28"),
+        "windDirection": str(payload.get("mockWindDirection") or "东南"),
+        "windPower": str(payload.get("mockWindPower") or "3"),
+        "humidity": str(payload.get("mockHumidity") or "62"),
+        "reportTime": "",
+        "adcode": adcode,
+        "source": "demo_fallback",
+    }
+    weather_cache[adcode] = fallback
+    return dict(fallback)
+
+
+def weather_route_effect(weather: Dict[str, Any], mode: str) -> Dict[str, Any]:
+    condition = str(weather.get("weather") or "未知")
+    temperature_match = re.search(r"-?\d+(?:\.\d+)?", str(weather.get("temperature") or ""))
+    temperature = float(temperature_match.group(0)) if temperature_match else None
+    wind_match = re.search(r"\d+", str(weather.get("windPower") or ""))
+    wind_power = int(wind_match.group(0)) if wind_match else 0
+    severe = any(token in condition for token in ("暴雨", "大雨", "雷电", "暴雪", "冰雹", "冻雨"))
+    wet = any(token in condition for token in ("雨", "雪", "雾"))
+    exposed_mode = mode in {"walking", "bicycling", "electrobike"}
+    extra_minutes = 0
+    score_penalty = 0.0
+    advice = f"当前天气{condition}"
+
+    if severe:
+        extra_minutes += 15 if mode == "driving" else 20
+        score_penalty += 24 if exposed_mode else 14
+        advice += "，建议预留更多通勤缓冲并避免骑行"
+    elif wet:
+        extra_minutes += 8 if mode == "driving" else 10 if mode == "transit" else 14
+        score_penalty += 6 if mode in {"driving", "transit"} else 12
+        advice += "，建议优先驾车或公共交通并预留路滑缓冲"
+    elif temperature is not None and temperature >= 35 and exposed_mode:
+        extra_minutes += 8
+        score_penalty += 10
+        advice += "，高温下不建议长时间步行或骑行"
+    elif wind_power >= 6 and mode in {"bicycling", "electrobike"}:
+        extra_minutes += 10
+        score_penalty += 12
+        advice += "，风力较大，建议改用公交或驾车"
+    else:
+        advice += "，对当前行程影响较小"
+
+    return {
+        "extraMinutes": extra_minutes,
+        "scorePenalty": score_penalty,
+        "risk": "high" if severe else "medium" if wet or score_penalty >= 10 else "low",
+        "unsafe": bool(severe and exposed_mode),
+        "advice": advice,
+    }
+
+
+def mode_cost(mode: str, distance_km: float, duration_minutes: int, store: Dict[str, Any]) -> float:
+    if mode == "driving":
+        parking = float(store.get("parkingFeePerHour") or 0) * 2
+        return round(12 + distance_km * 2.2 + parking, 2)
+    if mode == "transit":
+        return round(2 + distance_km * 0.45, 2)
+    if mode in {"bicycling", "electrobike"}:
+        return round(1 + distance_km * 0.12, 2)
+    return 0.0
+
+
+def route_estimate_for_store(payload: Dict[str, Any], store: Dict[str, Any], mode: str) -> Dict[str, Any]:
+    origin = payload.get("origin") or payload.get("start")
+    destination = store.get("location") or store.get("address")
+    if AMAP_KEY and origin and destination:
+        try:
+            return plan_route_tool({
+                "origin": origin,
+                "destination": destination,
+                "city": payload.get("city") or "南昌",
+                "mode": mode,
+            })
+        except Exception:
+            pass
+    distance = float(store.get("distanceKm") or 5.0)
+    minutes = int(store.get("drivingMinutes") or max(10, round(distance * 1.9 + 3)))
+    if mode == "transit":
+        minutes = int(store.get("transitMinutes") or minutes + 15)
+    elif mode == "walking":
+        minutes = max(minutes, round(distance * 12))
+    return {
+        "ok": True,
+        "provider": "demo_estimator",
+        "mode": mode,
+        "distanceKm": round(distance, 1),
+        "durationMinutes": minutes,
+        "navigationUrl": build_amap_link(str(origin or "当前位置"), str(destination or ""), mode),
+        "instructions": [f"从当前位置前往{store.get('name') or store.get('storeName')}"]
+    }
+
+
+def evaluate_store_fulfillment(payload: Dict[str, Any]) -> Dict[str, Any]:
+    constraints = extract_time_constraints(payload)
+    now = constraints["now"]
+    requested_start = constraints["requestedStart"]
+    finish_by = constraints["finishBy"]
+    context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+    loop = payload.get("agentLoop") if isinstance(payload.get("agentLoop"), dict) else {}
+    booking_result: Dict[str, Any] = {}
+    for item in loop.get("toolResults", []) if isinstance(loop.get("toolResults"), list) else []:
+        if not isinstance(item, dict) or str(item.get("toolName") or "") != "create_or_reschedule_appointment":
+            continue
+        candidate_result = item.get("result") if isinstance(item.get("result"), dict) else {}
+        if candidate_result.get("ok"):
+            booking_result = dict(candidate_result)
+            break
+    service_duration = int(payload.get("serviceDurationMinutes") or context.get("serviceDurationMinutes") or 110)
+    style_name = str(payload.get("styleName") or context.get("styleName") or parse_style_preference(payload))
+    preferred_mode = str(payload.get("mode") or payload.get("routeMode") or "driving")
+    if preferred_mode not in {"driving", "walking", "bicycling", "electrobike", "transit"}:
+        preferred_mode = "driving"
+    modes = [preferred_mode] if payload.get("travelModeFixed") else list(dict.fromkeys([preferred_mode, "transit"]))
+    evaluated: List[Dict[str, Any]] = []
+    weather_cache: Dict[str, Dict[str, Any]] = {}
+
+    for store in candidate_stores(payload, now):
+        store_name = str(store.get("name") or store.get("storeName") or "候选门店")
+        supported = bool(store.get("supportsStyle", True)) or style_name in list(store.get("supportedStyles") or [])
+        weather = fetch_weather_for_store(payload, store, weather_cache)
+        slots = [parse_datetime_text(item, now) for item in store.get("availableSlots", [])]
+        slots = sorted(item for item in slots if item is not None and item >= now)
+        if requested_start:
+            slots = sorted(slots, key=lambda item: (abs((item - requested_start).total_seconds()), item))
+        for mode in modes:
+            route = route_estimate_for_store(payload, store, mode)
+            raw_travel_minutes = int(route.get("durationMinutes") or 999)
+            weather_effect = weather_route_effect(weather, mode)
+            travel_minutes = raw_travel_minutes + int(weather_effect["extraMinutes"])
+            earliest_arrival_at = now + timedelta(minutes=travel_minutes)
+            ready_at = earliest_arrival_at + timedelta(minutes=10)
+            feasible_slots = [slot for slot in slots if ready_at <= slot]
+            selected_slot = feasible_slots[0] if feasible_slots else None
+            service_end = selected_slot + timedelta(minutes=service_duration) if selected_slot else None
+            before_deadline = finish_by is None or (service_end is not None and service_end <= finish_by)
+            feasible = bool(selected_slot and before_deadline and supported and not weather_effect["unsafe"])
+            distance = float(route.get("distanceKm") or store.get("distanceKm") or 0)
+            travel_cost = mode_cost(mode, distance, travel_minutes, store)
+            service_price = float(store.get("servicePrice") or store.get("baseServicePrice") or context.get("amount") or 268)
+            deadline_buffer = int((finish_by - service_end).total_seconds() / 60) if finish_by and service_end else 0
+            recommended_departure = (
+                selected_slot - timedelta(minutes=travel_minutes + 10)
+                if selected_slot else None
+            )
+            planned_arrival = selected_slot - timedelta(minutes=10) if selected_slot else None
+            score = (
+                (100 if feasible else 0)
+                + min(30, max(-30, deadline_buffer / 3))
+                - travel_minutes * 0.65
+                - travel_cost * 0.12
+                + (8 if store.get("parkingAvailable") and mode == "driving" else 0)
+                + (8 if supported else -25)
+                - float(weather_effect["scorePenalty"])
+            )
+            evaluated.append({
+                "storeId": store.get("storeId"),
+                "storeName": store_name,
+                "storeAddress": store.get("address") or store.get("storeAddress"),
+                "storeLocation": store.get("location"),
+                "mode": mode,
+                "distanceKm": round(distance, 1),
+                "rawTravelMinutes": raw_travel_minutes,
+                "travelMinutes": travel_minutes,
+                "weatherAdjustmentMinutes": int(weather_effect["extraMinutes"]),
+                "travelCost": travel_cost,
+                "servicePrice": service_price,
+                "estimatedTotalCost": round(service_price + travel_cost, 2),
+                "selectedSlot": selected_slot.isoformat(timespec="seconds") if selected_slot else None,
+                "earliestArrivalAt": earliest_arrival_at.isoformat(timespec="seconds"),
+                "recommendedDepartAt": recommended_departure.isoformat(timespec="seconds") if recommended_departure else None,
+                "arrivalAt": planned_arrival.isoformat(timespec="seconds") if planned_arrival else None,
+                "serviceEndAt": service_end.isoformat(timespec="seconds") if service_end else None,
+                "finishBy": finish_by.isoformat(timespec="seconds") if finish_by else None,
+                "deadlineBufferMinutes": deadline_buffer,
+                "parkingAvailable": bool(store.get("parkingAvailable")),
+                "parkingNote": store.get("parkingNote") or "",
+                "weather": weather.get("weather") or "未知",
+                "weatherDetail": weather,
+                "weatherSource": weather.get("source") or "demo_fallback",
+                "weatherRisk": weather_effect["risk"],
+                "weatherAdvice": weather_effect["advice"],
+                "supportsStyle": supported,
+                "feasible": feasible,
+                "score": round(score, 3),
+                "navigationUrl": route.get("navigationUrl") or "",
+                "routeSteps": route.get("instructions") or [],
+            })
+
+    ranked = sorted(evaluated, key=lambda item: (item["feasible"], item["score"]), reverse=True)
+    best = next((item for item in ranked if item["feasible"]), None)
+    if best is None:
+        return {
+            "ok": False,
+            "intent": "fulfillment",
+            "summary": "当前候选门店无法同时满足空位、通勤和结束时间约束，建议放宽时间或更换服务项目。",
+            "constraints": {
+                "requestedStart": requested_start.isoformat(timespec="seconds") if requested_start else None,
+                "finishBy": finish_by.isoformat(timespec="seconds") if finish_by else None,
+                "serviceDurationMinutes": service_duration,
+            },
+            "storeCandidates": ranked[:6],
+            "toolCalls": [],
+            "agentSource": "fulfillment_constraint_planner",
+        }
+
+    pending_action = context.get("pendingAction") if isinstance(context.get("pendingAction"), dict) else {}
+    rejected_pending = bool(pending_action) and any(
+        token in str(payload.get("message") or "")
+        for token in ("不要了", "取消", "算了", "不去了", "先不约")
+    )
+    if rejected_pending:
+        return {
+            "ok": True,
+            "intent": "fulfillment",
+            "summary": "已取消上一轮门店履约方案，不会创建或修改预约。",
+            "answer": "已取消上一轮门店履约方案，不会创建或修改预约。",
+            "pendingAction": None,
+            "requiresBookingConfirmation": False,
+            "toolCalls": [],
+            "storeCandidates": ranked[:6],
+            "agentSource": "fulfillment_pending_cancelled",
+        }
+    confirmed_pending = bool(pending_action) and any(
+        token in str(payload.get("message") or "")
+        for token in ("确认", "同意", "可以", "就这个", "帮我约")
+    )
+    auto_book = not booking_result and (bool(payload.get("autoBook")) or confirmed_pending or any(token in str(payload.get("message") or "") for token in (
+        "自动预约", "直接预约", "帮我预约", "就约这家", "可以，预约",
+    )))
+    booking_call = {
+        "id": f"fulfillment_booking_{best.get('storeId') or 'store'}",
+        "name": "create_or_reschedule_appointment",
+        "arguments": {
+            "scheduledAtIso": best["selectedSlot"],
+            "userFacingSlotText": best["selectedSlot"],
+            "requestSummary": f"门店履约Agent推荐{best['storeName']}并满足结束时间约束",
+            "action": "reschedule" if context.get("appointment") else "create",
+            "storeId": best.get("storeId"),
+            "storeName": best["storeName"],
+            "storeAddress": best.get("storeAddress"),
+        },
+    }
+    finish_text = f"，预计 {best['serviceEndAt'][11:16]} 完成" if best.get("serviceEndAt") else ""
+    depart_text = best.get("recommendedDepartAt", "")[11:16] if best.get("recommendedDepartAt") else "现在"
+    arrival_text = best.get("arrivalAt", "")[11:16] if best.get("arrivalAt") else "到店前"
+    weather_source_text = "高德实况天气" if best.get("weatherSource") == "amap_live" else "Demo 天气"
+    summary = (
+        f"推荐前往{best['storeName']}，{best['selectedSlot'][11:16]}可开始，"
+        f"建议 {depart_text} 出发、{arrival_text} 到店，通勤约{best['travelMinutes']}分钟{finish_text}；"
+        f"{weather_source_text}为{best['weather']}，{best['weatherAdvice']}；"
+        f"交通费用约{best['travelCost']}元，含服务预计{best['estimatedTotalCost']}元。"
+    )
+    if booking_result:
+        summary += f" 已完成预约，预约门店为{booking_result.get('storeName') or best['storeName']}。"
+    return {
+        "ok": True,
+        "intent": "fulfillment",
+        "summary": summary,
+        "answer": summary,
+        "recommendedStoreName": best["storeName"],
+        "storeName": best["storeName"],
+        "storeAddress": best.get("storeAddress"),
+        "recommendedSlot": best["selectedSlot"],
+        "serviceEndAt": best.get("serviceEndAt"),
+        "finishBy": best.get("finishBy"),
+        "bestMode": best["mode"],
+        "distanceKm": best["distanceKm"],
+        "durationMinutes": best["travelMinutes"],
+        "recommendedDepartAt": best.get("recommendedDepartAt"),
+        "arrivalAt": best.get("arrivalAt"),
+        "travelCost": best["travelCost"],
+        "estimatedTotalCost": best["estimatedTotalCost"],
+        "parkingNote": best["parkingNote"],
+        "weather": best["weather"],
+        "weatherDetail": best["weatherDetail"],
+        "weatherSource": best["weatherSource"],
+        "weatherRisk": best["weatherRisk"],
+        "weatherAdvice": best["weatherAdvice"],
+        "weatherAdjustmentMinutes": best["weatherAdjustmentMinutes"],
+        "navigationUrl": best["navigationUrl"],
+        "routeSteps": best["routeSteps"],
+        "travelPlan": {
+            "departAt": best.get("recommendedDepartAt"),
+            "arriveAt": best.get("arrivalAt"),
+            "serviceStartAt": best.get("selectedSlot"),
+            "serviceEndAt": best.get("serviceEndAt"),
+            "finishBy": best.get("finishBy"),
+            "deadlineBufferMinutes": best.get("deadlineBufferMinutes"),
+            "mode": best.get("mode"),
+            "weatherAdvice": best.get("weatherAdvice"),
+            "parkingNote": best.get("parkingNote"),
+        },
+        "storeCandidates": ranked[:6],
+        "requiresBookingConfirmation": not auto_book,
+        "pendingAction": None if auto_book else booking_call["arguments"],
+        "status": "tool_calls" if auto_book else "completed",
+        "toolCalls": [booking_call] if auto_book else [],
+        "appointment": booking_result or None,
+        "agentSource": "fulfillment_constraint_planner",
+    }
+
+
 def plan_route_tool(args: Dict[str, Any]) -> Dict[str, Any]:
     mode, endpoint = mode_to_endpoint(str(args.get("mode") or "driving"))
     city = str(args.get("city") or "")
@@ -624,6 +1097,18 @@ def run_tool_loop(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def run_agent(payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
+        message = str(payload.get("message") or payload.get("query") or "")
+        if (
+            payload.get("fulfillmentPlan")
+            or payload.get("storeCandidates")
+            or payload.get("finishBy")
+            or payload.get("deadline")
+            or any(token in message for token in (
+                "哪家店", "店满", "空位", "几点前", "有事", "做完", "搞定",
+                "停车", "费用", "赶得上", "自动预约",
+            ))
+        ):
+            return evaluate_store_fulfillment(payload)
         return run_tool_loop(payload)
     except Exception as exc:
         direct_args = {

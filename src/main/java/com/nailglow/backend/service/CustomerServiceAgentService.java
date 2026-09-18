@@ -41,6 +41,39 @@ public class CustomerServiceAgentService {
     @Value("${nailglow.agent-graph.enabled:${AGENT_GRAPH_ENABLED:true}}")
     private boolean agentGraphEnabled;
 
+    @Value("${nailglow.rag.enabled:${RAG_ENABLED:true}}")
+    private boolean ragEnabled;
+
+    @Value("${nailglow.rag.embedding-base-url:${RAG_EMBEDDING_BASE_URL:https://ark.cn-beijing.volces.com/api/v3}}")
+    private String ragEmbeddingBaseUrl;
+
+    @Value("${nailglow.rag.embedding-model:${RAG_EMBEDDING_MODEL:doubao-embedding-vision-251215}}")
+    private String ragEmbeddingModel;
+
+    @Value("${nailglow.rag.embedding-multimodal:${RAG_EMBEDDING_MULTIMODAL:true}}")
+    private boolean ragEmbeddingMultimodal;
+
+    @Value("${nailglow.rag.rerank-base-url:${RAG_RERANK_BASE_URL:https://dashscope.aliyuncs.com/compatible-api/v1}}")
+    private String ragRerankBaseUrl;
+
+    @Value("${nailglow.rag.rerank-model:${RAG_RERANK_MODEL:qwen3-rerank}}")
+    private String ragRerankModel;
+
+    @Value("${nailglow.rag.rerank-api-style:${RAG_RERANK_API_STYLE:auto}}")
+    private String ragRerankApiStyle;
+
+    @Value("${nailglow.rag.timeout-seconds:${RAG_TIMEOUT_SECONDS:45}}")
+    private long ragTimeoutSeconds;
+
+    @Value("${RAG_EMBEDDING_API_KEY:}")
+    private String configuredRagEmbeddingApiKey;
+
+    @Value("${RAG_RERANK_API_KEY:}")
+    private String configuredRagRerankApiKey;
+
+    @Value("${DASHSCOPE_API_KEY:}")
+    private String configuredDashscopeApiKey;
+
     public CustomerServiceAgentService(SystemSettingService systemSettingService) {
         this.systemSettingService = systemSettingService;
     }
@@ -89,6 +122,7 @@ public class CustomerServiceAgentService {
         Map<String, Object> appointment = findToolResult(toolResults, "create_or_reschedule_appointment");
         Map<String, Object> handoff = findToolResult(toolResults, "request_human_handoff");
         Map<String, Object> support = findToolResult(toolResults, "update_support_case");
+        syncAgentSessionStateWithToolResults(finalResult, appointment, support, handoff);
         if (!handoff.isEmpty() && bool(handoff.get("ok"))) {
             String message = stringValue(handoff.getOrDefault("handoffMessage", "已为你转接人工客服，请在当前对话等待回复。"));
             finalResult.put("answer", message);
@@ -115,12 +149,19 @@ public class CustomerServiceAgentService {
             String amount = stringValue(appointment.getOrDefault("amount", contextValue(payload, "amount", 268)));
             String duration = stringValue(appointment.getOrDefault("durationMinutes", contextValue(payload, "serviceDurationMinutes", 110)));
             String effectiveAction = stringValue(appointment.getOrDefault("effectiveAction", appointment.getOrDefault("requestedAction", "create")));
+            String storeName = stringValue(appointment.getOrDefault("storeName", "NailGlow 门店"));
+            Map<String, Object> delegatedRoute = mapValue(agentResult.get("delegatedRoute"));
+            String fulfillmentSummary = stringValue(delegatedRoute.get("summary"));
             if ("reschedule".equals(effectiveAction)) {
-                finalResult.put("answer", "已将你当前的有效预约更新为 " + slot + "，服务项目是" + service + "，金额约 ¥" + amount + "，服务约 " + duration + " 分钟。");
+                finalResult.put("answer", (fulfillmentSummary.isBlank() ? "" : fulfillmentSummary + " ")
+                        + "已将你当前的有效预约更新到" + storeName + "的 " + slot
+                        + "，服务项目是" + service + "，金额约 ¥" + amount + "，服务约 " + duration + " 分钟。");
             } else {
-                finalResult.put("answer", "已帮你预约 " + slot + "，服务项目是" + service + "，金额约 ¥" + amount + "，服务约 " + duration + " 分钟。");
+                finalResult.put("answer", (fulfillmentSummary.isBlank() ? "" : fulfillmentSummary + " ")
+                        + "已帮你预约" + storeName + "的 " + slot
+                        + "，服务项目是" + service + "，金额约 ¥" + amount + "，服务约 " + duration + " 分钟。");
             }
-            finalResult.put("intent", "appointment");
+            finalResult.put("intent", delegatedRoute.isEmpty() ? "appointment" : "fulfillment");
             return finalResult;
         }
         if (!support.isEmpty() && bool(support.get("ok"))) {
@@ -130,6 +171,41 @@ public class CustomerServiceAgentService {
             return finalResult;
         }
         return Map.of();
+    }
+
+    private void syncAgentSessionStateWithToolResults(Map<String, Object> finalResult,
+                                                      Map<String, Object> appointment,
+                                                      Map<String, Object> support,
+                                                      Map<String, Object> handoff) {
+        Map<String, Object> session = mapValue(finalResult.get("agentSessionState"));
+        if (session.isEmpty()) {
+            return;
+        }
+        String currentAgent = stringValue(session.getOrDefault("currentAgent", finalResult.getOrDefault("specialistAgent", "customer_agent")));
+        Map<String, Object> specialists = mapValue(session.get("specialists"));
+        Map<String, Object> specialist = mapValue(specialists.get(currentAgent));
+        if (specialist.isEmpty()) {
+            return;
+        }
+        Map<String, Object> workingMemory = mapValue(specialist.get("workingMemory"));
+        if (!appointment.isEmpty()) {
+            workingMemory.put("appointment", appointment);
+        }
+        if (!support.isEmpty()) {
+            workingMemory.put("supportCase", support);
+        }
+        if (!handoff.isEmpty()) {
+            workingMemory.put("handoff", handoff);
+        }
+        specialist.put("workingMemory", workingMemory);
+        specialist.put("status", bool(handoff.get("ok")) ? "HANDED_OFF_TO_HUMAN" : "COMPLETED");
+        specialists.put(currentAgent, specialist);
+        session.put("specialists", specialists);
+        finalResult.put("agentSessionState", session);
+        finalResult.put("specialistState", Map.of(
+                "currentAgent", currentAgent,
+                "specialistState", specialist
+        ));
     }
 
     private Map<String, Object> findToolResult(List<Map<String, Object>> toolResults, String toolName) {
@@ -174,6 +250,7 @@ public class CustomerServiceAgentService {
 
         try {
             String effectiveApiKey = systemSettingService.effectiveAiApiKey("customer_agent_api_key", apiKey, "CUSTOMER_AGENT_API_KEY");
+            String effectiveAmapKey = systemSettingService.effectiveAmapWebServiceKey();
             String effectiveBaseUrl = systemSettingService.effectiveAiBaseUrl("customer_agent_base_url", aiBaseUrl);
             String effectiveModel = systemSettingService.getText("customer_agent_model", aiModel);
             ProcessBuilder builder = new ProcessBuilder(pythonBin, scriptPath.toString());
@@ -190,6 +267,11 @@ public class CustomerServiceAgentService {
                 builder.environment().put("DEEPSEEK_API_KEY", effectiveApiKey);
                 builder.environment().put("OPENAI_API_KEY", effectiveApiKey);
             }
+            if (effectiveAmapKey != null && !effectiveAmapKey.isBlank()) {
+                builder.environment().put("AMAP_WEB_SERVICE_KEY", effectiveAmapKey);
+                builder.environment().put("AMAP_KEY", effectiveAmapKey);
+            }
+            applyRagEnvironment(builder);
             Process process = builder.start();
 
             try (BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(process.getOutputStream(), StandardCharsets.UTF_8))) {
@@ -231,6 +313,54 @@ public class CustomerServiceAgentService {
             }
         }
         return calls;
+    }
+
+    private void applyRagEnvironment(ProcessBuilder builder) {
+        builder.environment().put("RAG_ENABLED", String.valueOf(ragEnabled));
+        builder.environment().put("RAG_EMBEDDING_BASE_URL", systemSettingService.effectiveAiBaseUrl("rag_embedding_base_url", ragEmbeddingBaseUrl));
+        builder.environment().put("RAG_EMBEDDING_MODEL", systemSettingService.getText("rag_embedding_model", ragEmbeddingModel));
+        builder.environment().put("RAG_EMBEDDING_MULTIMODAL", String.valueOf(ragEmbeddingMultimodal));
+        builder.environment().put("RAG_RERANK_BASE_URL", ragRerankBaseUrl);
+        builder.environment().put("RAG_RERANK_MODEL", ragRerankModel);
+        builder.environment().put("RAG_RERANK_API_STYLE", ragRerankApiStyle);
+        builder.environment().put("RAG_TIMEOUT_SECONDS", String.valueOf(ragTimeoutSeconds));
+        String embeddingKey = systemSettingService.effectiveAiApiKey(
+                "rag_embedding_api_key",
+                configuredRagEmbeddingApiKey,
+                "RAG_EMBEDDING_API_KEY",
+                "DEEPSEEK_API_KEY"
+        );
+        if (!embeddingKey.isBlank()) {
+            builder.environment().put("RAG_EMBEDDING_API_KEY", embeddingKey);
+        }
+        String rerankKey = firstNonBlank(
+                systemSettingService.getText("rag_rerank_api_key", ""),
+                configuredDashscopeApiKey,
+                configuredRagRerankApiKey,
+                firstEnvironment("DASHSCOPE_API_KEY", "RAG_RERANK_API_KEY")
+        );
+        if (!rerankKey.isBlank()) {
+            builder.environment().put("RAG_RERANK_API_KEY", rerankKey);
+        }
+    }
+
+    private String firstEnvironment(String... names) {
+        for (String name : names) {
+            String value = System.getenv(name);
+            if (value != null && !value.isBlank()) {
+                return value.trim();
+            }
+        }
+        return "";
+    }
+
+    private String firstNonBlank(String... values) {
+        for (String value : values) {
+            if (value != null && !value.isBlank()) {
+                return value.trim();
+            }
+        }
+        return "";
     }
 
     private Map<String, Object> mapValue(Object value) {

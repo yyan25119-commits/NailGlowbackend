@@ -4,6 +4,7 @@ runtime/
 uploads/
 .venv/
 .venv-incomplete-*/
+.env.local
 /backend/
 *.log
 *.out.log

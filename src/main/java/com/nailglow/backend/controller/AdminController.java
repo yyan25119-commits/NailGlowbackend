@@ -5,6 +5,7 @@ import com.nailglow.backend.service.AdminRealtimeService;
 import com.nailglow.backend.service.AuthService;
 import com.nailglow.backend.service.DailyReportService;
 import com.nailglow.backend.service.ExternalTrendCollectorService;
+import com.nailglow.backend.service.RagKnowledgeBaseService;
 import com.nailglow.backend.service.SupportService;
 import com.nailglow.backend.service.SystemSettingService;
 import org.springframework.beans.factory.annotation.Value;
@@ -50,6 +51,7 @@ public class AdminController {
     private final SupportService supportService;
     private final AdminRealtimeService realtime;
     private final ExternalTrendCollectorService externalTrendCollector;
+    private final RagKnowledgeBaseService ragKnowledgeBaseService;
     private final SystemSettingService systemSettingService;
     private final DailyReportService dailyReportService;
     private final tools.jackson.databind.ObjectMapper mapper = new tools.jackson.databind.ObjectMapper();
@@ -59,6 +61,18 @@ public class AdminController {
 
     @Value("${nailglow.score-model.use-mediapipe:true}")
     private boolean scoreModelUseMediapipe;
+
+    @Value("${nailglow.score-model.training-timeout-seconds:180}")
+    private long scoreModelTrainingTimeoutSeconds;
+
+    @Value("${nailglow.score-model.activation-min-samples:20}")
+    private int scoreModelActivationMinSamples;
+
+    @Value("${nailglow.score-model.activation-min-groups:3}")
+    private int scoreModelActivationMinGroups;
+
+    @Value("${nailglow.score-model.activation-min-validation-score:60}")
+    private double scoreModelActivationMinValidationScore;
 
     @Value("${nailglow.doubao.api-key:}")
     private String aiApiKey;
@@ -79,12 +93,14 @@ public class AdminController {
                            SupportService supportService,
                            AdminRealtimeService realtime,
                            ExternalTrendCollectorService externalTrendCollector,
+                           RagKnowledgeBaseService ragKnowledgeBaseService,
                            SystemSettingService systemSettingService,
                            DailyReportService dailyReportService) {
         this.jdbc = jdbc;
         this.supportService = supportService;
         this.realtime = realtime;
         this.externalTrendCollector = externalTrendCollector;
+        this.ragKnowledgeBaseService = ragKnowledgeBaseService;
         this.systemSettingService = systemSettingService;
         this.dailyReportService = dailyReportService;
     }
@@ -307,6 +323,25 @@ public class AdminController {
         realtime.broadcast("trend_monitor.changed", Map.of("trendId", id, "publishedStyleId", data.getOrDefault("publishedStyleId", 0)));
         realtime.broadcast("styles.changed", Map.of("source", "external_trend_publish", "styleId", data.getOrDefault("publishedStyleId", 0)));
         return ApiResponse.ok(data);
+    }
+
+    @GetMapping("/rag/status")
+    public Map<String, Object> ragStatus() {
+        return ApiResponse.ok(ragKnowledgeBaseService.status());
+    }
+
+    @GetMapping("/rag/chunks")
+    public Map<String, Object> ragChunks(@RequestParam(defaultValue = "30") int limit) {
+        return ApiResponse.ok(ragKnowledgeBaseService.previewChunks(limit));
+    }
+
+    @PostMapping("/rag/reindex")
+    public Map<String, Object> reindexRag() {
+        Map<String, Object> result = ragKnowledgeBaseService.rebuild();
+        if (Boolean.TRUE.equals(result.get("ok"))) {
+            realtime.broadcast("rag.changed", Map.of("chunks", result.getOrDefault("chunks", 0)));
+        }
+        return ApiResponse.ok(result);
     }
 
     @GetMapping("/users")
@@ -734,18 +769,28 @@ public class AdminController {
         String stamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
         String versionName = "score_model_candidate_" + stamp + ".joblib";
         Path target = modelsDir().resolve("candidates").resolve(versionName).toAbsolutePath().normalize();
-        int sampleCount = countBySql("select count(*) from customer_photo_ratings");
-        double validationScore = trainCandidateModel(target, source);
+        ScoreModelTrainingResult training = trainCandidateModel(target, source);
         if (!Files.exists(target)) {
             Files.copy(source, target, StandardCopyOption.REPLACE_EXISTING);
         }
-        if (validationScore <= 0) {
-            validationScore = modelValidationScore();
-        }
+        int sampleCount = training.sampleCount() > 0
+                ? training.sampleCount()
+                : countBySql("select count(*) from customer_photo_ratings");
+        int groupCount = training.groupCount();
+        int responseCount = training.questionnaireResponseCount() > 0
+                ? training.questionnaireResponseCount()
+                : countBySql("select count(*) from customer_photo_ratings");
+        double validationScore = training.validationScore();
         jdbc.update("""
-                insert into score_model_versions(version_name, file_path, status, sample_count, validation_score, file_size, created_at)
-                values (?, ?, 'candidate', ?, ?, ?, current_timestamp)
-                """, "候选模型 " + stamp, target.toString(), sampleCount, validationScore, fileSize(target));
+                insert into score_model_versions(
+                  version_name, file_path, status, sample_count, group_count,
+                  questionnaire_response_count, validation_score, schema_version,
+                  dataset_source, metrics_json, file_size, created_at
+                ) values (?, ?, 'candidate', ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
+                """, "候选模型 " + stamp, target.toString(), sampleCount, groupCount,
+                responseCount, validationScore, training.schemaVersion(),
+                training.trained() ? "real-feedback" : "fallback-copy",
+                training.metricsJson(), fileSize(target));
         realtime.broadcast("score_models.changed", Map.of("created", versionName));
         return scoreModels();
     }
@@ -759,6 +804,20 @@ public class AdminController {
         Path path = resolveModelPath(String.valueOf(model.get("filePath")));
         if (!Files.exists(path)) {
             return ApiResponse.fail("模型文件不存在");
+        }
+        if ("nailglow-score-v2".equals(model.get("schemaVersion"))) {
+            int sampleCount = ((Number) model.getOrDefault("sampleCount", 0)).intValue();
+            int groupCount = ((Number) model.getOrDefault("groupCount", 0)).intValue();
+            double validationScore = ((Number) model.getOrDefault("validationScore", 0)).doubleValue();
+            if (sampleCount < scoreModelActivationMinSamples
+                    || groupCount < scoreModelActivationMinGroups
+                    || validationScore < scoreModelActivationMinValidationScore) {
+                return ApiResponse.fail(
+                        "候选模型未达到激活门槛：至少 " + scoreModelActivationMinSamples
+                                + " 个样本、" + scoreModelActivationMinGroups
+                                + " 个独立手部组，且交叉验证分不低于 "
+                                + scoreModelActivationMinValidationScore);
+            }
         }
         jdbc.update("update score_model_versions set status = 'backup' where status = 'active'");
         jdbc.update("update score_model_versions set status = 'active', activated_at = current_timestamp where id = ?", id);
@@ -781,9 +840,17 @@ public class AdminController {
         Path target = modelsDir().resolve("backups").resolve(source.getFileName().toString().replace(".joblib", "_" + stamp + ".joblib")).toAbsolutePath().normalize();
         Files.copy(source, target, StandardCopyOption.REPLACE_EXISTING);
         jdbc.update("""
-                insert into score_model_versions(version_name, file_path, status, sample_count, validation_score, file_size, created_at)
-                values (?, ?, 'backup', ?, ?, ?, current_timestamp)
-                """, "备份 " + stamp, target.toString(), model.get("sampleCount"), model.get("validationScore"), fileSize(target));
+                insert into score_model_versions(
+                  version_name, file_path, status, sample_count, group_count,
+                  questionnaire_response_count, validation_score, schema_version,
+                  dataset_source, metrics_json, file_size, created_at
+                ) values (?, ?, 'backup', ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
+                """, "备份 " + stamp, target.toString(), model.get("sampleCount"),
+                model.getOrDefault("groupCount", 0),
+                model.getOrDefault("questionnaireResponseCount", 0),
+                model.get("validationScore"), model.getOrDefault("schemaVersion", "legacy-v1"),
+                model.getOrDefault("datasetSource", "backup"),
+                model.getOrDefault("metricsJson", "{}"), fileSize(target));
         realtime.broadcast("score_models.changed", Map.of("backupId", id));
         return scoreModels();
     }
@@ -806,14 +873,14 @@ public class AdminController {
         return scoreModels();
     }
 
-    private double trainCandidateModel(Path target, Path fallbackSource) {
+    private ScoreModelTrainingResult trainCandidateModel(Path target, Path fallbackSource) {
         List<Map<String, Object>> samples = scoreTrainingSamples();
         if (samples.isEmpty()) {
-            return 0;
+            return ScoreModelTrainingResult.failed();
         }
         Path scriptPath = Path.of("src", "main", "python", "train_score_model.py").toAbsolutePath().normalize();
         if (!Files.exists(scriptPath)) {
-            return 0;
+            return ScoreModelTrainingResult.failed();
         }
         try {
             ProcessBuilder builder = new ProcessBuilder(pythonBin, scriptPath.toString())
@@ -825,36 +892,60 @@ public class AdminController {
                     "samples", samples,
                     "outputPath", target.toString(),
                     "fallbackModelPath", fallbackSource.toString(),
-                    "useMediapipe", scoreModelUseMediapipe
+                    "useMediapipe", scoreModelUseMediapipe,
+                    "datasetMetadata", Map.of(
+                            "synthetic", false,
+                            "source", "customer_photo_ratings",
+                            "labelContract", "five-dimension-v2"
+                    )
             );
             try (BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(process.getOutputStream(), StandardCharsets.UTF_8))) {
                 writer.write(mapper.writeValueAsString(request));
             }
-            boolean finished = process.waitFor(60, TimeUnit.SECONDS);
+            boolean finished = process.waitFor(
+                    Math.max(60, scoreModelTrainingTimeoutSeconds), TimeUnit.SECONDS);
             if (!finished) {
                 process.destroyForcibly();
-                return 0;
+                return ScoreModelTrainingResult.failed();
             }
             String stdout = readAll(process.getInputStream());
             if (process.exitValue() != 0 || stdout.isBlank()) {
-                return 0;
+                return ScoreModelTrainingResult.failed();
             }
             Map<String, Object> result = mapper.readValue(stdout, Map.class);
-            Object score = result.get("validationScore");
-            return score == null ? 0 : Double.parseDouble(String.valueOf(score));
+            return new ScoreModelTrainingResult(
+                    true,
+                    number(result.get("sampleCount")).intValue(),
+                    number(result.get("groupCount")).intValue(),
+                    number(result.get("questionnaireResponseCount")).intValue(),
+                    number(result.get("validationScore")).doubleValue(),
+                    String.valueOf(result.getOrDefault("schemaVersion", "unknown")),
+                    mapper.writeValueAsString(result.getOrDefault("cvMetrics", Map.of()))
+            );
         } catch (Exception ignored) {
-            return 0;
+            return ScoreModelTrainingResult.failed();
         }
     }
 
     private List<Map<String, Object>> scoreTrainingSamples() {
         return jdbc.query("""
-                select p.image_url, coalesce(s.style_code, 'nail_01') as style_code,
+                select p.id as photo_id, p.image_url,
+                       coalesce(s.style_code, 'nail_01') as style_code,
+                       count(r.id) as rating_count,
+                       avg(coalesce(r.fit_score, r.rating * 20)) as hand_fit,
+                       avg(coalesce(r.color_score, r.rating * 20)) as skin_tone,
+                       avg(coalesce(r.style_score, r.rating * 20)) as style_match,
+                       avg(coalesce(r.scene_score, r.rating * 20)) as scene_fit,
+                       avg(coalesce(r.aesthetic_score, r.rating * 20)) as aesthetic,
+                       avg(r.perceived_length_score) as perceived_length,
+                       avg(r.perceived_slenderness_score) as perceived_slenderness,
+                       avg(r.perceived_palm_width_score) as perceived_palm_width,
+                       avg(r.perceived_softness_score) as perceived_softness,
                        avg((coalesce(r.fit_score, r.rating * 20)
                          + coalesce(r.color_score, r.rating * 20)
                          + coalesce(r.style_score, r.rating * 20)
                          + coalesce(r.scene_score, r.rating * 20)
-                         + coalesce(r.aesthetic_score, r.rating * 20)) / 5) as target_score
+                         + coalesce(r.aesthetic_score, r.rating * 20)) / 5) as overall_score
                 from customer_photo_ratings r
                 join customer_photos p on p.id = r.photo_id
                 left join nail_styles s on s.id = p.style_id
@@ -867,12 +958,60 @@ public class AdminController {
             Path path = imageUrl.startsWith("/uploads/")
                     ? Path.of(imageUrl.substring(1)).toAbsolutePath().normalize()
                     : Path.of(imageUrl).toAbsolutePath().normalize();
-            return Map.of(
-                    "imagePath", path.toString(),
-                    "styleCode", rs.getString("style_code"),
-                    "targetScore", rs.getDouble("target_score")
-            );
+            Map<String, Object> targets = new LinkedHashMap<>();
+            targets.put("hand_fit", rs.getDouble("hand_fit"));
+            targets.put("skin_tone", rs.getDouble("skin_tone"));
+            targets.put("style_match", rs.getDouble("style_match"));
+            targets.put("scene_fit", rs.getDouble("scene_fit"));
+            targets.put("aesthetic", rs.getDouble("aesthetic"));
+            Map<String, Object> sample = new LinkedHashMap<>();
+            sample.put("groupId", "photo_" + rs.getLong("photo_id"));
+            sample.put("handId", "photo_" + rs.getLong("photo_id"));
+            sample.put("imagePath", path.toString());
+            sample.put("styleCode", rs.getString("style_code"));
+            sample.put("targets", targets);
+            Object perceivedLength = rs.getObject("perceived_length");
+            Object perceivedSlenderness = rs.getObject("perceived_slenderness");
+            Object perceivedPalmWidth = rs.getObject("perceived_palm_width");
+            Object perceivedSoftness = rs.getObject("perceived_softness");
+            if (perceivedLength != null && perceivedSlenderness != null
+                    && perceivedPalmWidth != null && perceivedSoftness != null) {
+                sample.put("morphologyTargets", Map.of(
+                        "perceived_length", ((Number) perceivedLength).doubleValue(),
+                        "perceived_slenderness", ((Number) perceivedSlenderness).doubleValue(),
+                        "perceived_palm_width", ((Number) perceivedPalmWidth).doubleValue(),
+                        "perceived_softness", ((Number) perceivedSoftness).doubleValue()
+                ));
+            }
+            sample.put("overallScore", rs.getDouble("overall_score"));
+            sample.put("ratingCount", rs.getInt("rating_count"));
+            return sample;
         });
+    }
+
+    private Number number(Object value) {
+        if (value instanceof Number number) return number;
+        try {
+            return Double.parseDouble(String.valueOf(value));
+        } catch (Exception ignored) {
+            return 0;
+        }
+    }
+
+    private record ScoreModelTrainingResult(
+            boolean trained,
+            int sampleCount,
+            int groupCount,
+            int questionnaireResponseCount,
+            double validationScore,
+            String schemaVersion,
+            String metricsJson
+    ) {
+        private static ScoreModelTrainingResult failed() {
+            return new ScoreModelTrainingResult(
+                    false, 0, 0, 0, 0.0, "legacy-v1", "{}"
+            );
+        }
     }
 
     private String readAll(InputStream stream) throws IOException {
@@ -893,7 +1032,20 @@ public class AdminController {
         row.put("filePath", rs.getString("file_path"));
         row.put("status", rs.getString("status"));
         row.put("sampleCount", rs.getInt("sample_count"));
+        row.put("groupCount", rs.getInt("group_count"));
+        row.put("questionnaireResponseCount", rs.getInt("questionnaire_response_count"));
         row.put("validationScore", rs.getDouble("validation_score"));
+        row.put("schemaVersion", rs.getString("schema_version"));
+        row.put("datasetSource", rs.getString("dataset_source"));
+        row.put("metricsJson", rs.getString("metrics_json"));
+        try {
+            String metricsJson = rs.getString("metrics_json");
+            row.put("metrics", StringUtils.hasText(metricsJson)
+                    ? mapper.readValue(metricsJson, Map.class)
+                    : Map.of());
+        } catch (Exception ignored) {
+            row.put("metrics", Map.of());
+        }
         row.put("fileSize", rs.getLong("file_size"));
         row.put("createdAt", safeTimestamp(rs, "created_at"));
         row.put("activatedAt", safeTimestamp(rs, "activated_at"));
@@ -905,9 +1057,17 @@ public class AdminController {
         if (count != null && count > 0) return;
         Path path = defaultScoreModelPath();
         jdbc.update("""
-                insert into score_model_versions(version_name, file_path, status, sample_count, validation_score, file_size, created_at, activated_at)
-                values ('score_model.joblib', ?, 'active', ?, ?, ?, current_timestamp, current_timestamp)
-                """, path.toString(), countBySql("select count(*) from customer_photo_ratings"), modelValidationScore(), fileSize(path));
+                insert into score_model_versions(
+                  version_name, file_path, status, sample_count, group_count,
+                  questionnaire_response_count, validation_score, schema_version,
+                  dataset_source, metrics_json, file_size, created_at, activated_at
+                ) values (
+                  'score_model.joblib', ?, 'active', ?, 0, ?, ?, 'legacy-v1',
+                  'bootstrap', '{}', ?, current_timestamp, current_timestamp
+                )
+                """, path.toString(), countBySql("select count(*) from customer_photo_ratings"),
+                countBySql("select count(*) from customer_photo_ratings"),
+                0.0, fileSize(path));
     }
 
     private Map<String, Object> findScoreModel(long id) {
@@ -960,18 +1120,6 @@ public class AdminController {
         } catch (IOException ignored) {
             return 0L;
         }
-    }
-
-    private double modelValidationScore() {
-        Double average = jdbc.queryForObject("""
-                select coalesce(avg((coalesce(fit_score, rating * 20)
-                  + coalesce(color_score, rating * 20)
-                  + coalesce(style_score, rating * 20)
-                  + coalesce(scene_score, rating * 20)
-                  + coalesce(aesthetic_score, rating * 20)) / 5), 0)
-                from customer_photo_ratings
-                """, Double.class);
-        return average == null ? 0 : average;
     }
 
     private Map<String, Object> stat(String label, Object value, String growth) {
