@@ -54,7 +54,9 @@ public class AdminController {
     private final RagKnowledgeBaseService ragKnowledgeBaseService;
     private final SystemSettingService systemSettingService;
     private final DailyReportService dailyReportService;
-    private final tools.jackson.databind.ObjectMapper mapper = new tools.jackson.databind.ObjectMapper();
+    private final AuthService authService;
+    private final com.nailglow.backend.service.RealtimeTrafficService trafficService;
+    private final com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
 
     @Value("${nailglow.python.bin:${PYTHON_BIN:python}}")
     private String pythonBin;
@@ -95,7 +97,9 @@ public class AdminController {
                            ExternalTrendCollectorService externalTrendCollector,
                            RagKnowledgeBaseService ragKnowledgeBaseService,
                            SystemSettingService systemSettingService,
-                           DailyReportService dailyReportService) {
+                           DailyReportService dailyReportService,
+                           AuthService authService,
+                           com.nailglow.backend.service.RealtimeTrafficService trafficService) {
         this.jdbc = jdbc;
         this.supportService = supportService;
         this.realtime = realtime;
@@ -103,6 +107,17 @@ public class AdminController {
         this.ragKnowledgeBaseService = ragKnowledgeBaseService;
         this.systemSettingService = systemSettingService;
         this.dailyReportService = dailyReportService;
+        this.authService = authService;
+        this.trafficService = trafficService;
+    }
+
+    /**
+     * 实时流量统计（Redis 计数器）。
+     * 独立路径，避免与既有 DB 统计接口 /traffic 冲突。
+     */
+    @GetMapping("/traffic/realtime")
+    public Map<String, Object> trafficRealtime() {
+        return ApiResponse.ok(trafficService.snapshot());
     }
 
     @GetMapping("/overview")
@@ -261,6 +276,8 @@ public class AdminController {
                 "trend", taskTrend()
         ));
         data.put("externalMonitor", externalTrendCollector.latestSnapshot());
+        // 追加 Redis 实时流量指标（新增字段，不影响既有前端读取）
+        data.put("realtime", trafficService.snapshot());
         return ApiResponse.ok(data);
     }
 
@@ -369,6 +386,10 @@ public class AdminController {
         String status = jdbc.queryForObject("select status from users where id = ? and role = 'user'", String.class, id);
         String next = "正常".equals(status) ? "观察" : "正常";
         jdbc.update("update users set status = ? where id = ? and role = 'user'", next, id);
+        // 登录态在 Redis：被停用/降级的账号必须立即失效，否则旧令牌在有效期内仍可用
+        if (!"正常".equals(next)) {
+            authService.kickOutUser(id);
+        }
         realtime.broadcast("users.changed", Map.of("userId", id, "status", next));
         return ApiResponse.ok(Map.of("status", next));
     }
@@ -388,6 +409,14 @@ public class AdminController {
         jdbc.update("delete from appointments where user_id = ?", id);
         jdbc.update("delete from try_on_tasks where user_id = ?", id);
         jdbc.update("delete from users where id = ? and role = 'user'", id);
+        // 同步清理若依权限表中的映射，避免残留账号仍可通过若依侧登录
+        try {
+            jdbc.update("delete from sys_user_role where user_id = ?", id);
+            jdbc.update("delete from sys_user where user_id = ?", id);
+        } catch (Exception ignored) {
+            // sys_* 表不存在时不阻断删除
+        }
+        authService.kickOutUser(id);
         realtime.broadcast("users.changed", Map.of("userId", id, "deleted", true));
         return ApiResponse.ok(Map.of("deleted", true));
     }
@@ -602,6 +631,14 @@ public class AdminController {
                 where s.role = 'user' or u.role = 'user'
                 """));
         deleted.put("users", jdbc.update("delete from users where role = 'user'"));
+        // 登录态已迁移到 Redis，清空业务用户的同时必须清理其令牌
+        deleted.put("redisSessions", authService.kickOutUsersByRole("user"));
+        try {
+            jdbc.update("delete from sys_user_role where user_id in (select user_id from sys_user where user_name <> 'admin')");
+            jdbc.update("delete from sys_user where user_name <> 'admin'");
+        } catch (Exception ignored) {
+            // sys_* 表不存在时不阻断
+        }
         jdbc.update("update nail_styles set try_count = 0");
         clearUploadDirectory(Path.of("uploads", "customer-photos"));
 
@@ -701,6 +738,8 @@ public class AdminController {
     public Map<String, Object> updateSetting(@PathVariable String key, @RequestBody Map<String, Object> body) {
         jdbc.update("update system_settings set value_text = ?, updated_at = current_timestamp where key_name = ?",
                 value(body, "value", ""), key);
+        // 设置项已缓存到 Redis，写入后必须失效，否则要等 TTL 过期才生效
+        systemSettingService.evictAll();
         return ApiResponse.ok(Map.of("updated", true));
     }
 

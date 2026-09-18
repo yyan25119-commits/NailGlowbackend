@@ -3,7 +3,7 @@ package com.nailglow.backend.service;
 import org.springframework.stereotype.Service;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
-import tools.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
 import java.time.LocalDateTime;
@@ -21,8 +21,13 @@ public class AdminRealtimeService {
         send(session, Map.of("type", "connected", "time", LocalDateTime.now().toString()));
     }
 
-    public void remove(WebSocketSession session) {
-        sessions.remove(session);
+    /**
+     * 移除会话。
+     *
+     * @return 该会话此前确实在集合中（用于避免重复递减在线计数）
+     */
+    public boolean remove(WebSocketSession session) {
+        return sessions.remove(session);
     }
 
     public void broadcast(String type) {

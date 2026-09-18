@@ -22,11 +22,47 @@ public class DatabaseInitializer implements CommandLineRunner {
     public void run(String... args) {
         createSchema();
         migrateSchema();
+        normalizeSysTableCollation();
         seedStyles();
         ensureAdminUser();
         ensureUserIdFloor();
         ensureScoreModelVersion();
         seedSettings();
+    }
+
+    /**
+     * 统一若依 sys_* 表与业务表的排序规则。
+     *
+     * <p>业务表由本类显式以 {@code utf8mb4_unicode_ci} 创建，而 sys_* 表来自
+     * 若依建表脚本、未声明字符集，会继承数据库默认排序规则（MySQL 8 通常是
+     * {@code utf8mb4_0900_ai_ci}）。两者不一致时，任何跨表字符串比较或 JOIN
+     * 都会抛出 {@code ERROR 1267 (HY000): Illegal mix of collations}。
+     *
+     * <p>这里把 sys_* 表统一转换成 {@code utf8mb4_unicode_ci}，保证业务表与
+     * 权限表可以互相 JOIN（例如按账号关联 users 与 sys_user）。
+     */
+    private void normalizeSysTableCollation() {
+        String[] sysTables = {
+                "sys_dept", "sys_user", "sys_post", "sys_role", "sys_menu",
+                "sys_user_role", "sys_role_menu", "sys_role_dept", "sys_user_post",
+                "sys_oper_log", "sys_dict_type", "sys_dict_data", "sys_config",
+                "sys_logininfor", "sys_notice", "sys_notice_read"
+        };
+        for (String table : sysTables) {
+            try {
+                String collation = jdbc.queryForObject("""
+                        select table_collation
+                        from information_schema.tables
+                        where table_schema = database() and table_name = ?
+                        """, String.class, table);
+                if (collation != null && !"utf8mb4_unicode_ci".equalsIgnoreCase(collation)) {
+                    jdbc.execute("alter table " + table
+                            + " convert to character set utf8mb4 collate utf8mb4_unicode_ci");
+                }
+            } catch (Exception ignored) {
+                // 表不存在或转换失败都不应阻断启动
+            }
+        }
     }
 
     private void createSchema() {
@@ -436,17 +472,22 @@ public class DatabaseInitializer implements CommandLineRunner {
         String adminPassword = System.getenv().getOrDefault("NAILGLOW_ADMIN_PASSWORD", "admin");
         Integer count = jdbc.queryForObject("select count(*) from users where account = 'admin' and role = 'admin'", Integer.class);
         if (count != null && count > 0) {
+            // 已存在则只修正展示字段，绝不覆盖口令。
+            // 重构前这里每次启动都用 SHA-256 重写 password_hash，会（1）把管理员
+            // 自行修改的密码重置回环境变量默认值，（2）把若依的 BCrypt 口令降级为
+            // 无盐 SHA-256。登录校验已兼容两种哈希，因此无需再改写。
             jdbc.update("""
                     update users
-                    set nickname = '管理员', password_hash = ?, status = '正常', favorite_style = null
+                    set nickname = '管理员', status = '正常', favorite_style = null
                     where account = 'admin' and role = 'admin'
-                    """, AuthService.hashPassword(adminPassword));
+                    """);
             return;
         }
+        // 新库首次初始化：使用若依标准 BCrypt 口令
         jdbc.update("""
                 insert into users(nickname, account, password_hash, role, status, joined_at, last_login_at, try_count, favorite_style)
                 values ('管理员', 'admin', ?, 'admin', '正常', current_timestamp, current_timestamp, 0, null)
-                """, AuthService.hashPassword(adminPassword));
+                """, AuthService.encodePassword(adminPassword));
     }
 
     private void ensureUserIdFloor() {

@@ -1,0 +1,168 @@
+# ==========================================================================
+# NailGlow 后端配置（若依 RuoYi-Vue 3.9.2 springboot3 基座 + Redis）
+# 说明：
+#   1. 本文件取代原 application.properties（原 nailglow.* 配置已整体迁入）。
+#   2. spring.config.import 保留，用于加载本地密钥文件 .env.local（已被 gitignore）。
+#   3. 数据源见 application-druid.yml。
+# ==========================================================================
+
+spring:
+  application:
+    name: NailGlow
+  # 本地密钥/开关文件（不入库），保留原有行为
+  config:
+    import: optional:file:.env.local[.properties]
+  # 国际化资源文件路径（若依）
+  messages:
+    basename: i18n/messages
+  profiles:
+    active: druid
+  # 文件上传（与原配置保持一致）
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      max-request-size: 20MB
+  # 若依 sys_* 权限表初始化：在数据源就绪后、若依 @PostConstruct 缓存加载之前执行。
+  # 脚本是幂等的（CREATE TABLE IF NOT EXISTS + INSERT IGNORE），可安全重复执行。
+  sql:
+    init:
+      mode: always
+      encoding: UTF-8
+      schema-locations: classpath:db/ruoyi-sys-schema.sql
+      continue-on-error: false
+  # Redis：承载若依登录令牌、验证码、字典/配置缓存与业务缓存
+  data:
+    redis:
+      host: ${REDIS_HOST:127.0.0.1}
+      port: ${REDIS_PORT:6379}
+      database: ${REDIS_DATABASE:0}
+      password: ${REDIS_PASSWORD:}
+      timeout: 10s
+      lettuce:
+        pool:
+          min-idle: 0
+          max-idle: 8
+          max-active: 8
+          max-wait: -1ms
+
+server:
+  port: 8080
+  servlet:
+    context-path: /
+  tomcat:
+    uri-encoding: UTF-8
+    accept-count: 1000
+    threads:
+      max: 800
+      min-spare: 100
+
+# --------------------------------------------------------------------------
+# 若依项目配置
+# --------------------------------------------------------------------------
+ruoyi:
+  name: NailGlow
+  version: 3.9.2
+  copyrightYear: 2026
+  # 若依文件上传根路径（/profile/** 映射到此处）
+  profile: ${RUOYI_PROFILE:./uploads/ruoyi}
+  # 获取ip地址开关（离线环境关闭，避免外呼）
+  addressEnabled: false
+  # 验证码类型 math 数字计算 char 字符验证
+  captchaType: math
+
+# 日志
+logging:
+  level:
+    com.ruoyi: info
+    com.nailglow: info
+    org.springframework: warn
+
+# 用户配置：密码错误次数与锁定时间（若依）
+user:
+  password:
+    maxRetryCount: 5
+    lockTime: 10
+
+# --------------------------------------------------------------------------
+# 令牌配置：NailGlow 沿用 7 天有效期（与原 SESSION_DAYS=7 对齐，前端无感）
+# --------------------------------------------------------------------------
+token:
+  header: Authorization
+  # 令牌密钥（生产请通过 TOKEN_SECRET 覆盖）
+  secret: ${TOKEN_SECRET:nailglow-ruoyi-redis-secret-key-please-override-in-prod}
+  # 令牌有效期（分钟）
+  expireTime: ${TOKEN_EXPIRE_MINUTES:10080}
+
+# --------------------------------------------------------------------------
+# MyBatis（若依）
+# --------------------------------------------------------------------------
+mybatis:
+  typeAliasesPackage: com.ruoyi.**.domain
+  mapperLocations: classpath*:mapper/**/*Mapper.xml
+  configLocation: classpath:mybatis/mybatis-config.xml
+
+# PageHelper 分页插件
+pagehelper:
+  helperDialect: mysql
+  supportMethodsArguments: true
+  params: count=countSql
+
+# 防盗链（默认关闭，保持前端直连）
+referer:
+  enabled: false
+  allowed-domains: localhost,127.0.0.1
+
+# XSS 过滤：仅作用于若依自身管理路径，避免影响 NailGlow /api 的 JSON 与上传
+xss:
+  enabled: true
+  excludes: /system/notice
+  urlPatterns: /system/*,/monitor/*,/tool/*
+
+# ==========================================================================
+# NailGlow 业务配置（原 application.properties 迁移，键名保持不变）
+# ==========================================================================
+nailglow:
+  doubao:
+    enabled: ${DOUBAO_ENABLED:true}
+    api-key: ${DOUBAO_API_KEY:${LUMIO_API_KEY:${LUMIO_IMAGE_API_KEY:${DEEPSEEK_API_KEY:${AI_API_KEY:${OPENAI_API_KEY:}}}}}}
+    endpoint: ${DOUBAO_IMAGE_ENDPOINT:${LUMIO_IMAGE_ENDPOINT:https://api.lumio.games/}}
+    model: ${DOUBAO_IMAGE_MODEL:${LUMIO_IMAGE_MODEL:gpt-image-2}}
+    size: ${DOUBAO_IMAGE_SIZE:1024x1024}
+    timeout-seconds: ${DOUBAO_IMAGE_TIMEOUT_SECONDS:240}
+  # Windows 下原 ./scripts/project-python 是 POSIX 脚本不可执行，改为可覆盖的 python 命令
+  python:
+    bin: ${PYTHON_BIN:python}
+  agent-graph:
+    enabled: ${AGENT_GRAPH_ENABLED:true}
+  rag:
+    enabled: ${RAG_ENABLED:true}
+    embedding-base-url: ${RAG_EMBEDDING_BASE_URL:https://ark.cn-beijing.volces.com/api/v3}
+    embedding-model: ${RAG_EMBEDDING_MODEL:doubao-embedding-vision-251215}
+    embedding-multimodal: ${RAG_EMBEDDING_MULTIMODAL:true}
+    rerank-base-url: ${RAG_RERANK_BASE_URL:https://dashscope.aliyuncs.com/compatible-api/v1}
+    rerank-model: ${RAG_RERANK_MODEL:qwen3-rerank}
+    rerank-api-style: ${RAG_RERANK_API_STYLE:auto}
+    timeout-seconds: ${RAG_TIMEOUT_SECONDS:45}
+  score-model:
+    use-mediapipe: ${SCORE_MODEL_USE_MEDIAPIPE:true}
+    timeout-seconds: ${SCORE_MODEL_TIMEOUT_SECONDS:60}
+    training-timeout-seconds: ${SCORE_MODEL_TRAINING_TIMEOUT_SECONDS:180}
+    activation-min-samples: ${SCORE_MODEL_ACTIVATION_MIN_SAMPLES:20}
+    activation-min-groups: ${SCORE_MODEL_ACTIVATION_MIN_GROUPS:3}
+    activation-min-validation-score: ${SCORE_MODEL_ACTIVATION_MIN_VALIDATION_SCORE:60}
+  customer-agent:
+    ai-base-url: ${AI_BASE_URL:https://ark.cn-beijing.volces.com/api/v3}
+    ai-model: ${CUSTOMER_AGENT_MODEL:doubao-seed-2-0-pro-260215}
+    timeout-seconds: ${CUSTOMER_AGENT_TIMEOUT_SECONDS:90}
+  route-agent:
+    ai-base-url: ${AI_BASE_URL:https://ark.cn-beijing.volces.com/api/v3}
+    ai-model: ${ROUTE_AGENT_MODEL:doubao-seed-2-0-pro-260215}
+    timeout-seconds: ${ROUTE_AGENT_TIMEOUT_SECONDS:35}
+  trend-agent:
+    ai-base-url: ${AI_BASE_URL:https://ark.cn-beijing.volces.com/api/v3}
+    ai-model: ${TREND_AGENT_MODEL:doubao-seed-2-0-pro-260215}
+    timeout-seconds: ${TREND_AGENT_TIMEOUT_SECONDS:28}
+  daily-report:
+    ai-base-url: ${AI_BASE_URL:https://ark.cn-beijing.volces.com/api/v3}
+    ai-model: ${DAILY_REPORT_MODEL:doubao-seed-2-0-pro-260215}
+    timeout-seconds: ${DAILY_REPORT_TIMEOUT_SECONDS:90}

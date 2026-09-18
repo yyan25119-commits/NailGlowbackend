@@ -58,7 +58,7 @@ public class UserController {
     private static final DateTimeFormatter SLOT_ABSOLUTE_FORMAT = DateTimeFormatter.ofPattern("M月d日 HH:mm");
     private static final DateTimeFormatter SLOT_ABSOLUTE_WITH_YEAR_FORMAT = DateTimeFormatter.ofPattern("yyyy年M月d日 HH:mm");
     private static final DateTimeFormatter SLOT_ISO_SECONDS_FORMAT = DateTimeFormatter.ofPattern("yyyy-M-d['T'][' ']H:mm[:ss]");
-    private final tools.jackson.databind.ObjectMapper mapper = new tools.jackson.databind.ObjectMapper();
+    private final com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
     private final JdbcTemplate jdbc;
     private final DoubaoImageService doubao;
     private final ScoreModelService scoreModel;
@@ -992,7 +992,7 @@ public class UserController {
         Object metrics = scoreResult.get("metrics");
         if (metrics instanceof Map<?, ?> metricMap && !metricMap.isEmpty()) {
             try {
-                return new tools.jackson.databind.ObjectMapper().writeValueAsString(normalizeMetricLabels(metrics));
+                return new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(normalizeMetricLabels(metrics));
             } catch (Exception ignored) {
             }
         }
@@ -1144,7 +1144,7 @@ public class UserController {
             return List.of();
         }
         try {
-            Object parsed = new tools.jackson.databind.ObjectMapper().readValue(raw, List.class);
+            Object parsed = new com.fasterxml.jackson.databind.ObjectMapper().readValue(raw, List.class);
             if (parsed instanceof List<?> list) {
                 return new ArrayList<>(list);
             }
